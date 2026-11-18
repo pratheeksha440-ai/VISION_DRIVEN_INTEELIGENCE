@@ -1,0 +1,5272 @@
+"""
+AI Smart Vision Assistant (Enhanced)
+
+Features
+- Real-time object detection with YOLOv8
+- Voice announcements with position (left / ahead / right) and distance (very close / close / nearby / far)
+- Object counting ("2 persons")
+- Priority danger warnings for very close objects
+- Per-object cooldown so speech is never spammy
+- Hotkeys: Q quit | M mute | D describe scene | S snapshot | P pause
+- Live FPS, object count and mute status overlay
+- Optional CSV detection log
+- Command line options for camera, confidence, model, etc.
+
+Install:  pip install ultralytics opencv-python pyttsx3
+Run:      python smart_vision_assistant.py
+"""
+
+import argparse
+import csv
+import itertools
+import os
+import queue
+import threading
+import time
+from collections import Counter
+from datetime import datetime
+
+import cv2
+import pyttsx3
+from ultralytics import YOLO
+
+# ----------------------------- Settings ------------------------------------
+
+# Fraction of the frame covered by a box -> distance label
+DISTANCE_LEVELS = [
+    (0.35, "very close"),
+    (0.12, "close"),
+    (0.03, "nearby"),
+    (0.00, "far"),
+]
+
+# Objects that deserve a warning when they are very close
+DANGER_OBJECTS = {
+    "person", "car", "truck", "bus", "motorcycle", "bicycle",
+    "dog", "horse", "train", "knife", "scissors",
+}
+
+COLORS = {
+    "very close": (0, 0, 255),    # red
+    "close": (0, 165, 255),       # orange
+    "nearby": (0, 255, 255),      # yellow
+    "far": (0, 255, 0),           # green
+}
+
+
+# ----------------------------- Speech --------------------------------------
+
+class Speaker:
+    """Background text-to-speech with priorities and anti-backlog protection."""
+
+    def __init__(self, rate=155):
+        self.rate = rate
+        self.muted = False
+        self._queue = queue.PriorityQueue()
+        self._counter = itertools.count()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def say(self, message, priority=1):
+        """priority 0 = urgent warning, 1 = normal."""
+        if self.muted:
+            return
+        # Drop normal messages if speech is falling behind
+        if priority > 0 and self._queue.qsize() >= 3:
+            return
+        self._queue.put((priority, next(self._counter), message))
+
+    def toggle_mute(self):
+        self.muted = not self.muted
+        if self.muted:
+            self._clear()
+        return self.muted
+
+    def _clear(self):
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def _worker(self):
+        engine = pyttsx3.init()
+        engine.setProperty("rate", self.rate)
+        while not self._stop.is_set():
+            try:
+                _, _, message = self._queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                engine.say(message)
+                engine.runAndWait()
+            except RuntimeError:
+                pass
+
+    def shutdown(self):
+        self._stop.set()
+        self._thread.join(timeout=2)
+
+
+# ----------------------------- Helpers -------------------------------------
+
+def get_position(x_center, frame_width):
+    if x_center < frame_width / 3:
+        return "on your left"
+    if x_center > 2 * frame_width / 3:
+        return "on your right"
+    return "ahead"
+
+
+def get_distance(box_area, frame_area):
+    ratio = box_area / frame_area
+    for threshold, label in DISTANCE_LEVELS:
+        if ratio >= threshold:
+            return label
+    return "far"
+
+
+def plural(name, count):
+    if count == 1:
+        return f"1 {name}"
+    if name == "person":
+        return f"{count} people"
+    return f"{count} {name}s"
+
+
+def describe_scene(detections):
+    if not detections:
+        return "I do not see anything"
+    counts = Counter(d["name"] for d in detections)
+    parts = [plural(n, c) for n, c in counts.items()]
+    if len(parts) > 1:
+        return "I can see " + ", ".join(parts[:-1]) + " and " + parts[-1]
+    return "I can see " + parts[0]
+
+
+def draw_label(frame, text, x1, y1, color):
+    (w, h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+    top = max(y1 - h - 10, 0)
+    cv2.rectangle(frame, (x1, top), (x1 + w + 6, top + h + 8), color, -1)
+    cv2.putText(frame, text, (x1 + 3, top + h + 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
+
+
+def draw_overlay(frame, fps, count, muted, paused):
+    h, w = frame.shape[:2]
+    # Zone guides (left / ahead / right)
+    cv2.line(frame, (w // 3, 0), (w // 3, h), (255, 255, 255), 1)
+    cv2.line(frame, (2 * w // 3, 0), (2 * w // 3, h), (255, 255, 255), 1)
+    status = f"FPS {fps:.1f} | Objects {count} | {'MUTED' if muted else 'VOICE ON'}"
+    if paused:
+        status += " | PAUSED"
+    cv2.rectangle(frame, (0, 0), (w, 28), (30, 30, 30), -1)
+    cv2.putText(frame, status, (8, 20), cv2.FONT_HERSHEY_SIMPLEX,
+                0.55, (255, 255, 255), 1)
+    cv2.putText(frame, "Q quit  M mute  D describe  S snapshot  P pause",
+                (8, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+
+# ----------------------------- Main ----------------------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(description="AI Smart Vision Assistant")
+    p.add_argument("--camera", type=int, default=0, help="camera index")
+    p.add_argument("--model", default="yolov8n.pt", help="YOLO model file")
+    p.add_argument("--conf", type=float, default=0.5, help="confidence threshold")
+    p.add_argument("--interval", type=float, default=5.0,
+                   help="seconds before repeating the same announcement")
+    p.add_argument("--log", action="store_true", help="save detections to CSV")
+    p.add_argument("--no-voice", action="store_true", help="start muted")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    model = YOLO(args.model)
+    speaker = Speaker()
+    speaker.muted = args.no_voice
+
+    camera = cv2.VideoCapture(args.camera)
+    if not camera.isOpened():
+        print("Camera not detected!")
+        return
+
+    os.makedirs("snapshots", exist_ok=True)
+
+    log_file = log_writer = None
+    if args.log:
+        log_file = open("detections_log.csv", "a", newline="")
+        log_writer = csv.writer(log_file)
+        if log_file.tell() == 0:
+            log_writer.writerow(["time", "object", "confidence", "position", "distance"])
+
+    last_announced = {}       # (name, position) -> timestamp
+    last_warned = {}          # name -> timestamp
+    WARNING_INTERVAL = 4
+    paused = False
+    muted_notice = False
+    fps, prev_time = 0.0, time.time()
+    detections = []
+    frame = None
+
+    print("AI Smart Vision Assistant Started")
+    print("Keys: Q quit | M mute | D describe | S snapshot | P pause")
+    speaker.say("Vision assistant started")
+
+    try:
+        while True:
+            if not paused:
+                success, frame = camera.read()
+                if not success:
+                    print("Camera frame error")
+                    break
+
+                frame_h, frame_w = frame.shape[:2]
+                frame_area = frame_w * frame_h
+
+                results = model(frame, conf=args.conf, verbose=False)
+                detections = []
+
+                for result in results:
+                    for box in result.boxes:
+                        name = model.names[int(box.cls[0])]
+                        conf = float(box.conf[0])
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+                        position = get_position((x1 + x2) / 2, frame_w)
+                        distance = get_distance((x2 - x1) * (y2 - y1), frame_area)
+
+                        detections.append({
+                            "name": name, "conf": conf,
+                            "position": position, "distance": distance,
+                        })
+
+                        color = COLORS[distance]
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                        draw_label(frame, f"{name} {conf:.2f} | {distance}",
+                                   x1, y1, color)
+
+                        if log_writer:
+                            log_writer.writerow([
+                                datetime.now().isoformat(timespec="seconds"),
+                                name, f"{conf:.2f}", position, distance,
+                            ])
+
+                now = time.time()
+
+                # Urgent warnings for dangerous, very close objects
+                for d in detections:
+                    if d["distance"] == "very close" and d["name"] in DANGER_OBJECTS:
+                        if now - last_warned.get(d["name"], 0) >= WARNING_INTERVAL:
+                            speaker.say(f"Warning! {d['name']} very close {d['position']}",
+                                        priority=0)
+                            last_warned[d["name"]] = now
+                            last_announced[(d["name"], d["position"])] = now
+
+                # Normal announcements: one per (object, position), grouped counts
+                grouped = Counter((d["name"], d["position"]) for d in detections)
+                for (name, position), count in grouped.items():
+                    if now - last_announced.get((name, position), 0) >= args.interval:
+                        nearest = [d["distance"] for d in detections
+                                   if d["name"] == name and d["position"] == position]
+                        label = plural(name, count)
+                        speaker.say(f"{label} {position}, {nearest[0]}")
+                        last_announced[(name, position)] = now
+
+                # FPS
+                fps = 0.9 * fps + 0.1 * (1.0 / max(now - prev_time, 1e-6))
+                prev_time = now
+
+            if frame is not None:
+                display = frame.copy()
+                draw_overlay(display, fps, len(detections), speaker.muted, paused)
+                cv2.imshow("AI Smart Vision Assistant", display)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+            elif key == ord("m"):
+                state = speaker.toggle_mute()
+                print("Voice muted" if state else "Voice on")
+                if not state:
+                    speaker.say("Voice on")
+            elif key == ord("d"):
+                speaker.say(describe_scene(detections))
+            elif key == ord("s") and frame is not None:
+                path = f"snapshots/snap_{datetime.now():%Y%m%d_%H%M%S}.jpg"
+                cv2.imwrite(path, frame)
+                print("Saved", path)
+                speaker.say("Snapshot saved")
+            elif key == ord("p"):
+                paused = not paused
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        camera.release()
+        cv2.destroyAllWindows()
+        if log_file:
+            log_file.close()
+        speaker.shutdown()
+        print("Smart Vision Assistant stopped")
+
+
+if __name__ == "__main__":
+    main()
+
+
+agriculture
+agriculture ripeness
+import cv2
+import numpy as np
+import csv
+import os
+import textwrap
+from datetime import datetime
+from collections import deque, Counter
+from tkinter import Tk, filedialog
+
+# ==========================================
+# SMART AGRICULTURE RIPENESS / FRESHNESS DETECTOR
+# (colour-based: HSV analysis)
+# ==========================================
+
+produce = "Tomato"
+history = deque(maxlen=20)
+report_file = "ripeness_report.csv"
+results_folder = "results"            # annotated result images are saved here
+
+# Maximum size (pixels) of the image inside the result window
+DISPLAY_MAX_W = 500
+DISPLAY_MAX_H = 400
+PANEL_W = 360                         # width of the information panel
+
+# Fruits are judged on RIPENESS, vegetables on FRESHNESS
+PRODUCE_LIST = [
+    "Tomato", "Banana", "Mango", "Avocado",          # fruits
+    "Capsicum", "Cucumber", "Carrot", "Brinjal",     # vegetables
+]
+VEGETABLES = {"Capsicum", "Cucumber", "Carrot", "Brinjal"}
+
+# Per item: (ROTTEN/SPOILED if rot% >= first, OVERRIPE/AGEING if rot% >= second)
+# These are starting points - tune them with your own images.
+RULES = {
+    "Tomato":   (25, 12),
+    "Banana":   (35, 15),
+    "Mango":    (30, 15),
+    "Avocado":  (30, 15),   # dark skin is normal for avocado, only brown counts as rot
+    "Capsicum": (25, 12),
+    "Cucumber": (25, 12),
+    "Carrot":   (25, 12),
+    "Brinjal":  (25, 12),
+}
+
+# Green vegetables turn yellow as they age: AGEING if yellow% >= this value
+VEG_YELLOW = {"Capsicum": 30, "Cucumber": 25}
+
+# Colours (BGR) used for each result
+STATUS_COLOR = {
+    "UNRIPE":         (0, 200, 255),
+    "PARTIALLY RIPE": (0, 140, 255),
+    "RIPE":           (0, 190, 0),
+    "OVERRIPE":       (30, 100, 200),
+    "ROTTEN":         (0, 0, 220),
+    "FRESH":          (0, 190, 0),
+    "AGEING":         (0, 140, 255),
+    "SPOILED":        (0, 0, 220),
+    "NOT FOUND":      (150, 150, 150),
+}
+
+# Advice and rough shelf-life estimates (general guidance, varies by variety/storage)
+ADVICE = {
+    "UNRIPE": (
+        "Not ready yet. Keep at room temperature, away from direct sun, "
+        "and check again in a few days.",
+        "Ready in about 3-7 days",
+    ),
+    "PARTIALLY RIPE": (
+        "Almost ready. Good for transport or storage; it will finish "
+        "ripening shortly.",
+        "Ready in about 1-3 days",
+    ),
+    "RIPE": (
+        "Best stage to eat, harvest or sell. Refrigerate to slow further "
+        "ripening if not used immediately.",
+        "Use within about 2-4 days",
+    ),
+    "OVERRIPE": (
+        "Past its best. Use quickly for cooking, juice, sauce or smoothies, "
+        "or sell at a reduced price.",
+        "Use within about 1 day",
+    ),
+    "ROTTEN": (
+        "Spoiled. Do not sell or eat. Remove it from other produce to "
+        "prevent the rot from spreading.",
+        "Discard now",
+    ),
+    "FRESH": (
+        "Fresh and good quality. Store in a cool place or the fridge "
+        "crisper and use within a few days.",
+        "Use within about 3-7 days",
+    ),
+    "AGEING": (
+        "Starting to age or wilt. Use soon in cooking and cut away any "
+        "soft or discoloured parts.",
+        "Use within about 1-2 days",
+    ),
+    "SPOILED": (
+        "Spoiled. Do not sell or eat. Remove it from other produce to "
+        "prevent the rot from spreading.",
+        "Discard now",
+    ),
+    "NOT FOUND": (
+        "Place the produce inside the white box on a plain, light "
+        "background with good lighting.",
+        "-",
+    ),
+}
+
+BAD_RESULTS = ("ROTTEN", "SPOILED")
+
+
+# ==========================================
+# DRAWING HELPERS
+# ==========================================
+
+def put_text(img, text, pos, scale=0.65, thickness=2, color=(255, 255, 255)):
+    """Text with a black outline - readable on any background."""
+    cv2.putText(img, text, pos, cv2.FONT_HERSHEY_SIMPLEX,
+                scale, (0, 0, 0), thickness + 3, cv2.LINE_AA)
+    cv2.putText(img, text, pos, cv2.FONT_HERSHEY_SIMPLEX,
+                scale, color, thickness, cv2.LINE_AA)
+
+
+def panel_text(img, text, pos, scale=0.5, color=(235, 235, 235), thickness=1):
+    cv2.putText(img, text, pos, cv2.FONT_HERSHEY_SIMPLEX,
+                scale, color, thickness, cv2.LINE_AA)
+
+
+def draw_bar(img, x, y, w, value, color, label):
+    """Horizontal percentage bar with a label above it."""
+    value = float(np.clip(value, 0, 100))
+    panel_text(img, label, (x, y), 0.5)
+    panel_text(img, f"{value:.1f}%", (x + w - 55, y), 0.5)
+    cv2.rectangle(img, (x, y + 8), (x + w, y + 22), (80, 80, 80), 1)
+    fill = int(w * value / 100)
+    if fill > 0:
+        cv2.rectangle(img, (x, y + 8), (x + fill, y + 22), color, -1)
+
+
+# ==========================================
+# ANALYSIS
+# ==========================================
+
+def not_found_info(mode, score_label):
+    return {
+        "result": "NOT FOUND", "score": 0.0, "confidence": 0.0,
+        "green": 0.0, "yellow": 0.0, "red": 0.0, "rot": 0.0,
+        "detected": False, "fruit_area": 0.0, "contour": None,
+        "mode": mode, "score_label": score_label,
+        "low_light": False, "brightness": 0.0,
+    }
+
+
+def analyse_fruit(image, item):
+    """Returns a dict with the result, scores, colour breakdown and outline."""
+
+    is_veg = item in VEGETABLES
+    mode = "Freshness" if is_veg else "Ripeness"
+    score_label = "Freshness score" if is_veg else "Maturity score"
+
+    # Resize for speed and consistent thresholds
+    scale = 300 / image.shape[1]
+    img = cv2.resize(image, (300, max(1, int(image.shape[0] * scale))))
+    img = cv2.GaussianBlur(img, (5, 5), 0)
+
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)          # OpenCV hue range: 0-179
+
+    # ---- Find the produce (largest coloured blob, holes filled) ----
+    mask = ((s > 45) & (v > 30)).astype(np.uint8) * 255
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+
+    cnts, _ = cv2.findContours(
+        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    fruit = np.zeros_like(mask)
+    contour = None
+    detected = False
+
+    if cnts:
+        c = max(cnts, key=cv2.contourArea)
+        area = cv2.contourArea(c)
+        if 0.03 * mask.size < area < 0.92 * mask.size:
+            cv2.drawContours(fruit, [c], -1, 255, -1)   # filled: rot spots stay inside
+            contour = c.astype(np.float32) / scale       # back to original image size
+            detected = True
+
+    # IMPORTANT: if nothing was found, do NOT analyse the whole frame
+    # (a dark background would be counted as rot).
+    if not detected:
+        return not_found_info(mode, score_label)
+
+    area_px = int(np.count_nonzero(fruit))
+    area_pct = 100.0 * area_px / fruit.size
+
+    # ---- Ignore the shaded edge of the produce ----
+    k_size = max(5, int(0.08 * np.sqrt(area_px)) | 1)
+    inner = cv2.erode(
+        fruit, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+    )
+    if np.count_nonzero(inner) < 0.3 * area_px:
+        inner = fruit
+
+    m = inner > 0
+    total = int(m.sum())
+
+    # ---- Lighting: judge darkness RELATIVE to the produce's own brightness ----
+    brightness = float(np.median(v[m]))
+    low_light = brightness < 70
+    rel = v.astype(np.float32) / max(brightness, 1.0)
+
+    coloured = s > 45
+
+    dark = (rel < 0.45) & m
+    brown = coloured & (h >= 5) & (h <= 22) & (rel < 0.70) & m
+
+    rot_mask = brown if item == "Avocado" else (dark | brown)
+
+    # Remove specks: keep only real blotches
+    rot_u8 = rot_mask.astype(np.uint8) * 255
+    rot_u8 = cv2.morphologyEx(rot_u8, cv2.MORPH_OPEN,
+                              np.ones((3, 3), np.uint8))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(rot_u8)
+
+    min_blob = max(12, int(0.004 * total))
+    clean = np.zeros_like(rot_u8)
+
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] >= min_blob:
+            clean[labels == i] = 255
+
+    rot = 100.0 * np.count_nonzero(clean) / total
+
+    def pct(cond):
+        return 100.0 * np.count_nonzero(cond & m) / total
+
+    green  = pct(coloured & (h >= 35) & (h <= 85))
+    yellow = pct(coloured & (h >= 20) & (h < 35))
+    red    = pct(coloured & ((h < 20) | (h >= 165)))
+
+    rotten_t, over_t = RULES.get(item, (25, 12))
+
+    # ---- Classification ----
+    if is_veg:
+
+        yellow_t = VEG_YELLOW.get(item)
+
+        if rot >= rotten_t:
+            result = "SPOILED"
+            margin = rot - rotten_t
+        elif rot >= over_t:
+            result = "AGEING"
+            margin = min(rot - over_t, rotten_t - rot)
+        elif yellow_t is not None and yellow >= yellow_t:
+            result = "AGEING"
+            margin = yellow - yellow_t
+        else:
+            result = "FRESH"
+            margin = over_t - rot
+            if yellow_t is not None:
+                margin = min(margin, yellow_t - yellow)
+
+        score = 100 - min(100, rot * 2 + (yellow * 0.5 if yellow_t else 0))
+
+    else:
+
+        if rot >= rotten_t:
+            result = "ROTTEN"
+            margin = rot - rotten_t
+        elif green >= 50:
+            result = "UNRIPE"
+            margin = min(green - 50, rotten_t - rot)
+        elif green >= 20:
+            result = "PARTIALLY RIPE"
+            margin = min(green - 20, 50 - green, rotten_t - rot)
+        elif rot >= over_t:
+            result = "OVERRIPE"
+            margin = min(rot - over_t, rotten_t - rot, 20 - green)
+        else:
+            result = "RIPE"
+            margin = min(20 - green, over_t - rot)
+
+        score = (100 - green) + rot * 0.5
+
+    confidence = float(np.clip(50 + margin * 2.5, 50, 99))
+
+    return {
+        "result": result,
+        "score": float(max(0, min(100, score))),
+        "confidence": confidence,
+        "green": green,
+        "yellow": yellow,
+        "red": red,
+        "rot": rot,
+        "detected": True,
+        "fruit_area": area_pct,
+        "contour": contour,
+        "mode": mode,
+        "score_label": score_label,
+        "low_light": low_light,
+        "brightness": brightness,
+    }
+
+
+def stable_vote(results):
+    """Majority vote over recent frames. A 'bad' result needs 7 of 10 frames."""
+
+    counts = Counter(results)
+    best, n = counts.most_common(1)[0]
+
+    if best in BAD_RESULTS and n < 7:
+        others = [r for r, _ in counts.most_common() if r not in BAD_RESULTS]
+        if others:
+            return others[0]
+
+    return best
+
+
+# ==========================================
+# SAVE REPORT
+# ==========================================
+
+def save_report(item, info):
+
+    file_exists = os.path.exists(report_file)
+    advice, shelf = ADVICE[info["result"]]
+
+    with open(report_file, "a", newline="") as file:
+
+        writer = csv.writer(file)
+
+        if not file_exists:
+            writer.writerow([
+                "Date", "Time", "Fruit", "Ripeness", "Confidence %",
+                "Maturity Score", "Green %", "Yellow %", "Red/Orange %",
+                "Rot/Dark %", "Shelf Life Estimate", "Advice"
+            ])
+
+        now = datetime.now()
+
+        writer.writerow([
+            now.strftime("%Y-%m-%d"),
+            now.strftime("%H:%M:%S"),
+            item,
+            info["result"],
+            round(info["confidence"], 1),
+            round(info["score"], 2),
+            round(info["green"], 2),
+            round(info["yellow"], 2),
+            round(info["red"], 2),
+            round(info["rot"], 2),
+            shelf,
+            advice
+        ])
+
+    print("Report saved successfully!")
+
+
+# ==========================================
+# BUILD RESULT WINDOW (image + info panel)
+# ==========================================
+
+def build_result_image(image, item, info):
+
+    result = info["result"]
+    color = STATUS_COLOR[result]
+    advice, shelf = ADVICE[result]
+
+    # ---- Image, shrunk to fit, with outline ----
+    ih, iw = image.shape[:2]
+    scale = min(DISPLAY_MAX_W / iw, DISPLAY_MAX_H / ih)
+    interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC
+    img = cv2.resize(image, None, fx=scale, fy=scale, interpolation=interp)
+
+    if info["contour"] is not None:
+        pts = (info["contour"] * scale).astype(np.int32)
+        cv2.drawContours(img, [pts], -1, color, 3)
+
+    # ---- Canvas: image on the left, dark info panel on the right ----
+    H = max(img.shape[0], 540)
+    W = img.shape[1] + PANEL_W
+    canvas = np.full((H, W, 3), (35, 35, 35), dtype=np.uint8)
+    canvas[:img.shape[0], :img.shape[1]] = img
+
+    x0 = img.shape[1] + 15
+    bw = PANEL_W - 30
+
+    panel_text(canvas, "SMART AGRICULTURE SYSTEM", (x0, 28), 0.6,
+               (255, 255, 255), 2)
+    panel_text(canvas, f"Produce: {item}  ({info['mode']})", (x0, 55), 0.55)
+
+    # Status banner
+    cv2.rectangle(canvas, (x0, 68), (x0 + bw, 112), color, -1)
+    text_size = cv2.getTextSize(result, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)[0]
+    tx = x0 + (bw - text_size[0]) // 2
+    cv2.putText(canvas, result, (tx, 100), cv2.FONT_HERSHEY_SIMPLEX,
+                0.9, (255, 255, 255), 2, cv2.LINE_AA)
+
+    y = 140
+    panel_text(canvas, f"Confidence (estimate): {info['confidence']:.0f}%",
+               (x0, y), 0.5)
+
+    if not info["detected"]:
+        y += 22
+        panel_text(canvas, "Warning: produce outline not found.", (x0, y),
+                   0.45, (0, 165, 255))
+        y += 18
+        panel_text(canvas, "Use a plain, light background.", (x0, y), 0.45,
+                   (0, 165, 255))
+    elif info["low_light"]:
+        y += 22
+        panel_text(canvas, "Low light: add more light for accuracy.",
+                   (x0, y), 0.45, (0, 165, 255))
+
+    # Bars
+    y += 35
+    draw_bar(canvas, x0, y, bw, info["score"], color, info["score_label"])
+    y += 42
+    draw_bar(canvas, x0, y, bw, info["green"], (0, 190, 0), "Green")
+    y += 42
+    draw_bar(canvas, x0, y, bw, info["yellow"], (0, 215, 255), "Yellow")
+    y += 42
+    draw_bar(canvas, x0, y, bw, info["red"], (60, 60, 230), "Red / Orange")
+    y += 42
+    draw_bar(canvas, x0, y, bw, info["rot"], (40, 90, 150), "Rot / Dark spots")
+
+    # Advice
+    y += 45
+    panel_text(canvas, "Recommendation:", (x0, y), 0.5, (255, 255, 255), 1)
+    for line in textwrap.wrap(advice, width=38):
+        y += 20
+        panel_text(canvas, line, (x0, y), 0.48)
+
+    y += 28
+    panel_text(canvas, f"Shelf life: {shelf}", (x0, y), 0.48, color, 1)
+
+    panel_text(canvas, datetime.now().strftime("%Y-%m-%d  %H:%M:%S"),
+               (x0, H - 15), 0.45, (150, 150, 150))
+
+    return canvas
+
+
+def show_result(image, item):
+
+    info = analyse_fruit(image, item)
+    canvas = build_result_image(image, item, info)
+
+    cv2.namedWindow("Produce Analysis", cv2.WINDOW_AUTOSIZE)
+    cv2.imshow("Produce Analysis", canvas)
+
+    return info, canvas
+
+
+# ==========================================
+# IMAGE UPLOAD
+# ==========================================
+
+def upload_image():
+
+    root = Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+
+    path = filedialog.askopenfilename(
+        title="Select Fruit or Vegetable Image",
+        filetypes=[("Image Files", "*.jpg *.jpeg *.png *.bmp")]
+    )
+
+    root.destroy()
+
+    if not path:
+        return
+
+    image = cv2.imread(path)
+
+    if image is None:
+        print("Unable to load image!")
+        return
+
+    info, canvas = show_result(image, produce)
+
+    if info["result"] == "NOT FOUND":
+        print("\nNo produce found in the image. Use a plain, light background "
+              "and good lighting.")
+        return
+
+    history.append((produce, info["result"], info["score"]))
+
+    save_report(produce, info)
+
+    os.makedirs(results_folder, exist_ok=True)
+    out_name = datetime.now().strftime("result_%Y%m%d_%H%M%S.png")
+    out_path = os.path.join(results_folder, out_name)
+    cv2.imwrite(out_path, canvas)
+
+    advice, shelf = ADVICE[info["result"]]
+
+    print("\n========== ANALYSIS RESULT ==========")
+    print(f"Produce          : {produce} ({info['mode']})")
+    print(f"Result           : {info['result']}")
+    print(f"Confidence       : {info['confidence']:.0f}% (estimate)")
+    print(f"{info['score_label']:<17}: {info['score']:.1f}/100")
+    print(f"Green            : {info['green']:.1f}%")
+    print(f"Yellow           : {info['yellow']:.1f}%")
+    print(f"Red/Orange       : {info['red']:.1f}%")
+    print(f"Rot/Dark spots   : {info['rot']:.1f}%")
+    print(f"Shelf life       : {shelf}")
+    print(f"Recommendation   : {advice}")
+    if info["low_light"]:
+        print("Note             : low light, add more light for accuracy")
+    print(f"Annotated image  : {out_path}")
+    print("=====================================")
+
+
+# ==========================================
+# DETECTION HISTORY
+# ==========================================
+
+def show_history():
+
+    print("\n========== DETECTION HISTORY ==========")
+
+    if not history:
+        print("No detection history available.")
+        return
+
+    for i, record in enumerate(history, 1):
+        print(f"{i}. {record[0]} - {record[1]} - {record[2]:.1f}/100")
+
+    print("=======================================")
+
+
+# ==========================================
+# LIVE WEBCAM DETECTION
+# ==========================================
+
+def live_camera():
+
+    global produce
+
+    cap = cv2.VideoCapture(0)
+
+    if not cap.isOpened():
+        print("Camera not found!")
+        return
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+    stable_history = deque(maxlen=10)
+
+    key_to_item = {ord(str(i + 1)): name for i, name in enumerate(PRODUCE_LIST)}
+
+    while True:
+
+        ret, frame = cap.read()
+
+        if not ret:
+            break
+
+        frame = cv2.flip(frame, 1)
+
+        h, w = frame.shape[:2]
+
+        # Central analysis region
+        x1, y1 = int(w * 0.15), int(h * 0.15)
+        x2, y2 = int(w * 0.85), int(h * 0.85)
+
+        roi = frame[y1:y2, x1:x2]
+
+        info = analyse_fruit(roi, produce)
+
+        stable_history.append(info["result"])
+        stable_result = stable_vote(stable_history)
+        color = STATUS_COLOR[stable_result]
+
+        display = frame.copy()
+
+        cv2.rectangle(display, (x1, y1), (x2, y2), (255, 255, 255), 1)
+
+        if info["contour"] is not None:
+            pts = info["contour"].astype(np.int32) + np.array([x1, y1])
+            cv2.drawContours(display, [pts], -1, color, 3)
+
+        # Info box
+        cv2.rectangle(display, (0, 0), (430, 235), (30, 30, 30), -1)
+        cv2.rectangle(display, (0, 0), (430, 235), color, 2)
+
+        put_text(display, "SMART AGRICULTURE", (15, 32), 0.7)
+        put_text(display, f"{produce} ({info['mode']})", (15, 65), 0.6)
+
+        cv2.rectangle(display, (15, 78), (415, 115), color, -1)
+        cv2.putText(display, stable_result, (25, 107),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2,
+                    cv2.LINE_AA)
+
+        put_text(display,
+                 f"Score: {info['score']:.0f}/100   Conf: {info['confidence']:.0f}%",
+                 (15, 143), 0.55, 1)
+        put_text(display,
+                 f"Green {info['green']:.0f}%  Yellow {info['yellow']:.0f}%  "
+                 f"Red {info['red']:.0f}%",
+                 (15, 170), 0.5, 1)
+        put_text(display, f"Rot/Dark spots: {info['rot']:.0f}%",
+                 (15, 195), 0.5, 1)
+        put_text(display, ADVICE[stable_result][1], (15, 222), 0.5, 1)
+
+        if info["low_light"]:
+            put_text(display, "Low light: add more light for accuracy",
+                     (15, 262), 0.55, 1, (0, 165, 255))
+
+        put_text(display, "1 Tomato  2 Banana  3 Mango  4 Avocado",
+                 (10, h - 80), 0.5, 1)
+        put_text(display, "5 Capsicum  6 Cucumber  7 Carrot  8 Brinjal",
+                 (10, h - 55), 0.5, 1)
+        put_text(display, "S Save  H History  U Upload  Q Quit",
+                 (10, h - 20), 0.5, 1)
+
+        cv2.imshow("Live Ripeness / Freshness Detection", display)
+
+        key = cv2.waitKey(1) & 0xFF
+
+        if key in key_to_item:
+            produce = key_to_item[key]
+            stable_history.clear()
+
+        elif key == ord('s'):
+            if stable_result == "NOT FOUND":
+                print("No produce in view - nothing to save.")
+            else:
+                saved = dict(info)
+                saved["result"] = stable_result
+                history.append((produce, stable_result, info["score"]))
+                save_report(produce, saved)
+
+        elif key == ord('h'):
+            show_history()
+
+        elif key == ord('u'):
+            upload_image()
+
+        elif key == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+# ==========================================
+# MAIN MENU
+# ==========================================
+
+if __name__ == "__main__":
+
+    print("\n====================================")
+    print("      SMART AGRICULTURE SYSTEM")
+    print("   RIPENESS / FRESHNESS DETECTION")
+    print("====================================")
+
+    print("\n1. Live Webcam Detection")
+    print("2. Upload Image")
+
+    choice = input("\nSelect Option: ")
+
+    print("\nSelect Produce:")
+    for i, name in enumerate(PRODUCE_LIST, 1):
+        kind = "vegetable" if name in VEGETABLES else "fruit"
+        print(f"{i}. {name} ({kind})")
+
+    fruit_choice = input("\nEnter Choice: ")
+
+    items = {str(i + 1): name for i, name in enumerate(PRODUCE_LIST)}
+
+    produce = items.get(fruit_choice, "Tomato")
+
+    if choice == "1":
+        live_camera()
+
+    elif choice == "2":
+        upload_image()
+        print("\nPress any key in the image window to close it.")
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+    else:
+        print("Invalid Option!")
+
+Agriculture_ripness - Agriculture
+
+Leaf Detection
+import cv2
+import numpy as np
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from PIL import Image, ImageTk
+from datetime import datetime
+import csv
+import os
+import queue
+import threading
+
+# Install requirements if needed:
+#   pip install opencv-python pillow numpy transformers torch
+#
+# HOW IT WORKS
+#   1. AI model (needs transformers + torch, internet once to download):
+#      names the crop and the disease. It is trained on the PlantVillage
+#      dataset: Apple, Blueberry, Cherry, Corn, Grape, Orange, Peach, Pepper,
+#      Potato, Raspberry, Soybean, Squash, Strawberry, Tomato.
+#   2. Colour analysis (always runs, instant): highlights damaged areas
+#      (spots, yellowing, white coating) and estimates how much of the leaf
+#      is affected.
+#   3. Only a GREEN LEAF is analysed. Faces, hands and skin are detected and
+#      ignored, and nothing outside the webcam guide box is looked at.
+#   If the AI model cannot load, the colour analysis still gives a rough
+#   verdict with precautions.
+
+try:
+    from transformers import pipeline
+    AI_AVAILABLE = True
+except Exception:
+    pipeline = None
+    AI_AVAILABLE = False
+
+# Pretrained PlantVillage classifier from Hugging Face (change if you have a better one)
+MODEL_ID = "linkanjarad/mobilenet_v2_1.0_224-plant-disease-identification"
+
+IMAGE_W = 620
+IMAGE_H = 440
+BG = "#eaf4e5"
+# Webcam guide box (left, top, right, bottom as fractions of the frame).
+# Only what is inside this box is analysed.
+GUIDE = (0.15, 0.15, 0.85, 0.85)
+REPORT_FILE = "leaf_disease_report.csv"
+
+# ==========================================
+# DISEASE KNOWLEDGE BASE
+# (matched by keywords found in the model's label; most specific first)
+# ==========================================
+
+DISEASES = [
+    (("northern leaf blight",), "Northern Leaf Blight",
+     "Fungus (Exserohilum turcicum)",
+     "Long, cigar-shaped grey-green to tan lesions on the leaves.",
+     ["Plant resistant hybrids.",
+      "Rotate crops and bury or remove crop residue after harvest.",
+      "Avoid overcrowding so leaves dry quickly.",
+      "Apply a recommended fungicide if infection starts early and spreads."]),
+
+    (("early blight",), "Early Blight",
+     "Fungus (Alternaria solani)",
+     "Brown spots with ring-like patterns and a yellow halo, starting on older leaves.",
+     ["Remove and destroy infected leaves.",
+      "Rotate crops every 2-3 years.",
+      "Water at the base; avoid wetting the leaves.",
+      "Space plants and mulch for airflow and to stop soil splash.",
+      "Use a recommended fungicide if it keeps spreading."]),
+
+    (("late blight",), "Late Blight",
+     "Oomycete (Phytophthora infestans)",
+     "Dark, water-soaked patches that turn brown; white fuzzy growth underneath "
+     "in humid weather. Spreads very fast.",
+     ["Remove and destroy infected plants; do not compost them.",
+      "Plant certified disease-free seed or tubers.",
+      "Avoid overhead watering and improve airflow.",
+      "Apply preventive fungicide in cool, wet weather as locally advised.",
+      "Do not store tubers or fruit from infected plants."]),
+
+    (("bacterial spot",), "Bacterial Spot",
+     "Bacteria (Xanthomonas species)",
+     "Small dark, water-soaked spots that turn brown with yellow halos; spots may "
+     "drop out leaving small holes.",
+     ["Use disease-free seed and healthy transplants.",
+      "Avoid working among wet plants.",
+      "Remove infected leaves and crop debris.",
+      "Rotate with non-host crops for 2-3 years.",
+      "Copper-based sprays may slow spread (follow local advice)."]),
+
+    (("leaf mold",), "Leaf Mold",
+     "Fungus (Passalora fulva)",
+     "Pale yellow patches on the upper side and olive-grey mold underneath; "
+     "common in humid, poorly ventilated conditions.",
+     ["Improve ventilation and reduce humidity.",
+      "Water at the base, in the morning.",
+      "Remove infected leaves.",
+      "Choose resistant varieties.",
+      "Apply a suitable fungicide if severe."]),
+
+    (("septoria",), "Septoria Leaf Spot",
+     "Fungus (Septoria lycopersici)",
+     "Many small round spots with dark borders and grey centres, starting on lower leaves.",
+     ["Remove infected lower leaves.",
+      "Mulch to prevent soil splash.",
+      "Rotate crops and clear plant debris after harvest.",
+      "Avoid overhead watering.",
+      "Use a recommended fungicide if widespread."]),
+
+    (("spider mite",), "Spider Mite Damage",
+     "Pest (two-spotted spider mite)",
+     "Tiny yellow or bronze speckles and fine webbing under the leaves; worse in "
+     "hot, dry weather.",
+     ["Spray leaf undersides with a strong jet of water.",
+      "Avoid drought stress and dusty conditions.",
+      "Use neem oil or insecticidal soap; a miticide only if severe.",
+      "Encourage natural predators such as ladybirds and predatory mites.",
+      "Isolate or remove heavily infested plants."]),
+
+    (("target spot",), "Target Spot",
+     "Fungus (Corynespora cassiicola)",
+     "Brown spots with concentric rings and a yellow halo on leaves, stems and fruit.",
+     ["Remove infected leaves and debris.",
+      "Improve airflow and avoid dense planting.",
+      "Water at the base of the plant.",
+      "Rotate crops.",
+      "Use a recommended fungicide if needed."]),
+
+    (("yellow leaf curl",), "Yellow Leaf Curl Virus",
+     "Virus spread by whiteflies",
+     "Leaves curl upward, turn yellow and stay small; plants are stunted with poor fruit set.",
+     ["Control whiteflies: yellow sticky traps, neem oil, insect-proof nets.",
+      "Remove and destroy infected plants early.",
+      "Use resistant varieties and virus-free seedlings.",
+      "Control weeds that host whiteflies.",
+      "There is no cure once a plant is infected."]),
+
+    (("mosaic",), "Mosaic Virus",
+     "Virus spread by contact, tools, aphids and sometimes seed",
+     "Mottled light and dark green patches; leaves may be distorted or curled.",
+     ["Remove and destroy infected plants.",
+      "Wash hands and disinfect tools between plants.",
+      "Use certified virus-free seed and resistant varieties.",
+      "Control aphids and weeds.",
+      "There is no cure once a plant is infected."]),
+
+    (("cedar apple rust",), "Cedar Apple Rust",
+     "Fungus (Gymnosporangium juniperi-virginianae)",
+     "Bright yellow-orange spots on leaves, later with small tube-like growths underneath.",
+     ["Remove nearby juniper or cedar hosts if possible.",
+      "Plant resistant varieties.",
+      "Apply protective fungicide in spring as locally advised.",
+      "Remove badly infected leaves."]),
+
+    (("apple scab", "scab"), "Apple Scab",
+     "Fungus (Venturia inaequalis)",
+     "Olive-green to dark scabby spots on leaves and fruit; leaves may yellow and drop.",
+     ["Rake and destroy fallen leaves.",
+      "Prune for good air circulation.",
+      "Plant resistant varieties.",
+      "Apply fungicide from bud break as locally advised."]),
+
+    (("black rot",), "Black Rot",
+     "Fungus (Botryosphaeria / Guignardia species)",
+     "Brown circular leaf spots with dark borders; fruit can rot and shrivel.",
+     ["Remove mummified fruit and infected leaves or cankers.",
+      "Prune for airflow.",
+      "Avoid overhead irrigation.",
+      "Apply fungicide during early growth as locally advised."]),
+
+    (("powdery mildew",), "Powdery Mildew",
+     "Fungus (various species)",
+     "White powdery coating on leaves; leaves may curl or turn yellow.",
+     ["Improve airflow and sunlight; do not overcrowd plants.",
+      "Avoid excess nitrogen fertiliser.",
+      "Remove badly infected leaves.",
+      "Spray sulphur, neem oil or potassium bicarbonate, or a recommended fungicide."]),
+
+    (("cercospora", "gray leaf spot", "grey leaf spot"), "Gray Leaf Spot",
+     "Fungus (Cercospora zeae-maydis)",
+     "Long, narrow grey-to-tan rectangular lesions between the leaf veins.",
+     ["Rotate crops and till crop residue under.",
+      "Plant resistant hybrids.",
+      "Avoid dense planting; improve airflow.",
+      "Apply fungicide if infection starts early."]),
+
+    (("common rust",), "Common Rust",
+     "Fungus (Puccinia sorghi)",
+     "Small reddish-brown powdery pustules on both leaf surfaces.",
+     ["Plant resistant hybrids.",
+      "Plant early in the season.",
+      "Monitor fields regularly.",
+      "Apply fungicide if pustules appear early on many plants."]),
+
+    (("esca", "black measles"), "Esca (Black Measles)",
+     "Fungal complex affecting grapevine wood",
+     "Tiger-stripe pattern: yellow or red areas between veins that dry brown; "
+     "spotted berries.",
+     ["Prune in dry weather and seal large pruning wounds.",
+      "Remove and burn infected wood.",
+      "Avoid pruning in wet periods.",
+      "There is no effective cure; protect young vines."]),
+
+    (("isariopsis", "leaf blight"), "Leaf Blight (Isariopsis Leaf Spot)",
+     "Fungus (Pseudocercospora vitis)",
+     "Dark brown angular spots, yellowing and early leaf drop.",
+     ["Remove and destroy fallen leaves.",
+      "Prune for airflow.",
+      "Avoid overhead watering.",
+      "Apply fungicide as locally advised."]),
+
+    (("haunglongbing", "citrus greening"), "Citrus Greening (Huanglongbing)",
+     "Bacteria spread by the Asian citrus psyllid",
+     "Blotchy yellow mottling of leaves, small lopsided bitter fruit and tree decline.",
+     ["Control psyllid insects.",
+      "Plant certified disease-free nursery trees.",
+      "Remove infected trees to protect healthy ones.",
+      "Report suspected cases to your local agriculture authority. No cure exists."]),
+
+    (("leaf scorch",), "Leaf Scorch",
+     "Fungus (Diplocarpon earlianum)",
+     "Purple-brown spots that merge, giving leaf edges a scorched look.",
+     ["Remove infected leaves.",
+      "Water at the base and improve airflow.",
+      "Renew old beds and use resistant varieties.",
+      "Use a fungicide if severe."]),
+]
+
+GENERIC_PRECAUTIONS = [
+    "Remove and destroy badly affected leaves (do not compost them).",
+    "Water at the base of the plant; avoid wetting the leaves.",
+    "Keep tools clean and plants well spaced for airflow.",
+    "Take a clear photo of the affected leaf and ask your local agriculture "
+    "office or plant clinic to confirm before spraying anything.",
+]
+
+HEALTHY_TIPS = [
+    "Water at the base and avoid wetting the leaves.",
+    "Give plants enough space for good airflow.",
+    "Use balanced fertiliser; avoid too much nitrogen.",
+    "Inspect leaves weekly, including the undersides.",
+    "Clear fallen leaves and weeds around the plants.",
+]
+
+# Used when the AI model is not available (colour analysis only)
+COLOUR_ISSUES = {
+    "Leaf spots / blight": (
+        "Brown or dark spots, which can be fungal or bacterial leaf spot or blight.",
+        GENERIC_PRECAUTIONS),
+    "Yellowing (chlorosis)": (
+        "Yellow leaf areas, which may be nutrient deficiency, overwatering, "
+        "a virus or a pest.",
+        ["Check watering: avoid waterlogged or very dry soil.",
+         "Test the soil and add balanced fertiliser (nitrogen, iron or magnesium "
+         "may be low).",
+         "Check the undersides of leaves for pests such as mites, aphids or whiteflies.",
+         "Remove badly yellowed leaves and watch whether it spreads."]),
+    "Possible powdery mildew": (
+        "White powdery patches, typical of powdery mildew.",
+        ["Improve airflow and sunlight; do not overcrowd plants.",
+         "Avoid excess nitrogen fertiliser.",
+         "Remove badly infected leaves.",
+         "Spray sulphur, neem oil or potassium bicarbonate, or a recommended fungicide."]),
+}
+
+
+# ==========================================
+# HELPERS
+# ==========================================
+
+def find_disease_info(label):
+    text = label.lower().replace("_", " ")
+
+    for keywords, name, cause, symptoms, precautions in DISEASES:
+        if any(k in text for k in keywords):
+            return name, cause, symptoms, precautions
+
+    return None
+
+
+def parse_label(label):
+    """'Tomato___Late_blight' -> ('Tomato', 'Late blight')."""
+
+    if "___" in label:
+        crop, condition = label.split("___", 1)
+    else:
+        crop, condition = "Unknown crop", label
+
+    crop = crop.replace("_", " ").replace(",", "").strip()
+    condition = condition.replace("_", " ").strip()
+
+    return crop, condition
+
+
+def severity_from(percent):
+
+    if percent < 3:
+        return "None / very low"
+    if percent < 10:
+        return "Mild"
+    if percent < 25:
+        return "Moderate"
+    return "Severe"
+
+
+# ==========================================
+# COLOUR / LESION ANALYSIS (instant)
+# ==========================================
+
+_face_cascade = None
+
+
+def detect_faces(bgr):
+    """Find people's faces so they can be ignored. Returns (x, y, w, h) boxes."""
+
+    global _face_cascade
+
+    if _face_cascade is None:
+        try:
+            path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+            cascade = cv2.CascadeClassifier(path)
+            _face_cascade = cascade if not cascade.empty() else False
+        except Exception:
+            _face_cascade = False
+
+    if _face_cascade is False:
+        return []
+
+    h0, w0 = bgr.shape[:2]
+    scale = min(1.0, 400 / max(h0, w0))
+
+    small = cv2.resize(bgr, None, fx=scale, fy=scale,
+                       interpolation=cv2.INTER_AREA) if scale < 1 else bgr
+
+    gray = cv2.equalizeHist(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY))
+
+    min_side = max(24, int(0.06 * small.shape[1]))
+
+    faces = _face_cascade.detectMultiScale(
+        gray, 1.2, 5, minSize=(min_side, min_side)
+    )
+
+    return [(int(x / scale), int(y / scale), int(w / scale), int(h / scale))
+            for (x, y, w, h) in faces]
+
+
+def draw_label(img, text, pos, color=(255, 255, 255), scale=0.6):
+    """Text with a black outline, readable on any background."""
+
+    x, y = pos
+    y = max(18, y)
+
+    cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale,
+                (0, 0, 0), 4, cv2.LINE_AA)
+    cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale,
+                color, 2, cv2.LINE_AA)
+
+
+def keep_big_blobs(mask, min_area):
+    """Keep only connected regions of at least min_area pixels."""
+
+    u8 = mask.astype(np.uint8) * 255
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(u8)
+
+    out = np.zeros(mask.shape, dtype=bool)
+
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            out |= labels == i
+
+    return out
+
+
+def segment_leaf(bgr, faces=None, max_side=400):
+    """Find the green leaf only. People (faces, hands, skin) are excluded.
+
+    A leaf must be GREEN. Brown or yellow damage is only counted when it is
+    inside, or right next to, that green leaf, and never on skin or a face.
+    """
+
+    h0, w0 = bgr.shape[:2]
+    scale = min(1.0, max_side / max(h0, w0))
+
+    small = cv2.resize(bgr, None, fx=scale, fy=scale,
+                       interpolation=cv2.INTER_AREA) if scale < 1 else bgr.copy()
+
+    not_found = {"found": False, "small": small, "scale": scale,
+                 "mask": None, "contour": None, "bbox": None}
+
+    blur = cv2.GaussianBlur(small, (5, 5), 0)
+    hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+
+    ycrcb = cv2.cvtColor(blur, cv2.COLOR_BGR2YCrCb)
+    cr, cb = ycrcb[:, :, 1], ycrcb[:, :, 2]
+
+    # Skin tones (faces, hands, fingers holding the leaf)
+    skin = ((cr >= 133) & (cr <= 173) & (cb >= 77) & (cb <= 127)
+            & (h <= 25) & (s < 170) & (v > 100))
+
+    # Detected faces, with some margin
+    face_mask = np.zeros(h.shape, dtype=bool)
+
+    for (fx, fy, fw, fh) in (faces or []):
+        pad = int(0.3 * max(fw, fh))
+        x1 = max(0, int((fx - pad) * scale))
+        y1 = max(0, int((fy - pad) * scale))
+        x2 = min(h.shape[1], int((fx + fw + pad) * scale))
+        y2 = min(h.shape[0], int((fy + fh + pad) * scale))
+        face_mask[y1:y2, x1:x2] = True
+
+    # ---- The leaf is the largest GREEN region ----
+    green = ((h >= 30) & (h <= 90) & (s > 40) & (v > 40)
+             & ~skin & ~face_mask)
+
+    green_u8 = green.astype(np.uint8) * 255
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    green_u8 = cv2.morphologyEx(green_u8, cv2.MORPH_OPEN, k)
+    green_u8 = cv2.morphologyEx(green_u8, cv2.MORPH_CLOSE, k)
+
+    contours, _ = cv2.findContours(
+        green_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    if not contours:
+        return not_found
+
+    c = max(contours, key=cv2.contourArea)
+
+    if cv2.contourArea(c) < 0.03 * green_u8.size:
+        return not_found
+
+    filled = np.zeros(green_u8.shape, dtype=np.uint8)
+    cv2.drawContours(filled, [c], -1, 255, -1)      # holes (lesions) filled
+    filled_b = filled > 0
+    filled_area = int(filled_b.sum())
+
+    # Brown / yellow damage right at the leaf edge (never on skin or faces)
+    band_size = max(5, int(0.05 * max(h.shape)) | 1)
+    dilated = cv2.dilate(
+        filled, cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                          (band_size, band_size))
+    ) > 0
+    band = dilated & ~filled_b
+
+    lesion_like = (((h >= 5) & (h < 35) & (s > 40)) | (v < 60)) \
+        & ~skin & ~face_mask
+
+    # A big skin-coloured patch inside the outline is a finger, not damage
+    interior_skin = keep_big_blobs(
+        skin & filled_b, max(150, int(0.04 * filled_area))
+    )
+
+    leaf = (filled_b & ~interior_skin & ~face_mask) | (band & lesion_like)
+
+    ys, xs = np.where(leaf)
+
+    if len(xs) == 0 or leaf.sum() < 0.03 * leaf.size:
+        return not_found
+
+    return {
+        "found": True,
+        "small": small,
+        "scale": scale,
+        "mask": leaf,
+        "contour": c,
+        "bbox": (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())),
+    }
+
+
+def analyse_lesions(bgr, faces=None):
+
+    seg = segment_leaf(bgr, faces)
+    small = seg["small"]
+
+    if not seg["found"]:
+        return {
+            "leaf_found": False, "overlay": small, "leaf_image": None,
+            "necrosis": 0.0, "yellow": 0.0, "white": 0.0, "affected": 0.0,
+            "severity": "-", "issues": [],
+        }
+
+    m = seg["mask"]
+    total = max(1, int(m.sum()))
+
+    blur = cv2.GaussianBlur(small, (5, 5), 0)
+    hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+
+    # ---- Colour classes inside the leaf only ----
+    yellow = (h >= 20) & (h < 35) & (s > 60) & (v > 100) & m
+    necrosis = (((h >= 5) & (h < 20) & (s > 40)) | (v < 60)) & m
+    white = (s < 40) & (v > 180) & m
+
+    affected = necrosis | yellow | white
+
+    def pct(mask):
+        return 100.0 * np.count_nonzero(mask) / total
+
+    necrosis_pct = pct(necrosis)
+    yellow_pct = pct(yellow)
+    white_pct = pct(white)
+    affected_pct = pct(affected)
+
+    # ---- Highlight overlay (leaf only) ----
+    tint = small.copy()
+    tint[yellow] = (0, 165, 255)       # orange: yellowing
+    tint[white] = (255, 120, 0)        # blue: white coating
+    tint[necrosis] = (0, 0, 255)       # red: spots / dead tissue
+
+    overlay = cv2.addWeighted(small, 0.5, tint, 0.5, 0)
+    overlay[~affected] = small[~affected]
+
+    cv2.drawContours(overlay, [seg["contour"]], -1, (0, 200, 0), 2)
+
+    # ---- Leaf-only image for the AI model (background and people removed) ----
+    leaf_img = small.copy()
+    leaf_img[~m] = (190, 190, 190)
+
+    x0, y0, x1, y1 = seg["bbox"]
+    pad = int(0.05 * max(x1 - x0, y1 - y0))
+    leaf_img = leaf_img[max(0, y0 - pad):y1 + pad + 1,
+                        max(0, x0 - pad):x1 + pad + 1]
+
+    # ---- Rough verdict (used when the AI model is unavailable) ----
+    issues = []
+
+    if necrosis_pct >= 4:
+        issues.append("Leaf spots / blight")
+    if yellow_pct >= 12:
+        issues.append("Yellowing (chlorosis)")
+    if white_pct >= 6:
+        issues.append("Possible powdery mildew")
+
+    return {
+        "leaf_found": True,
+        "overlay": overlay,
+        "leaf_image": leaf_img,
+        "necrosis": necrosis_pct,
+        "yellow": yellow_pct,
+        "white": white_pct,
+        "affected": affected_pct,
+        "severity": severity_from(affected_pct),
+        "issues": issues,
+    }
+
+
+# ==========================================
+# APPLICATION
+# ==========================================
+
+class LeafDiseaseApp:
+
+    def __init__(self, root):
+
+        self.root = root
+        self.root.title("Multi-Crop Leaf Disease Detection")
+        self.root.geometry("1200x700")
+        self.root.minsize(1100, 660)
+        self.root.configure(bg=BG)
+
+        self.camera = None
+        self.current_image = None
+        self.photo = None
+        self.heur = None
+        self.last_result = None
+
+        self.result_queue = queue.Queue()
+        self.model_lock = threading.Lock()
+        self.classifier = None
+        self.classifier_error = None
+        self.analysis_id = 0
+        self.frame_count = 0
+        self.preview_faces = []
+
+        self.build_ui()
+
+        self.root.protocol("WM_DELETE_WINDOW", self.close_app)
+        self.root.after(100, self.poll_queue)
+
+        if AI_AVAILABLE:
+            self.set_status("Loading the disease model in the background "
+                            "(first run downloads it)...")
+            threading.Thread(target=self.preload_model, daemon=True).start()
+        else:
+            self.set_status("AI model not installed (colour analysis only). "
+                            "For disease names run: pip install transformers torch")
+
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
+
+    def build_ui(self):
+
+        tk.Label(
+            self.root,
+            text="LEAF DISEASE DETECTION SYSTEM",
+            font=("Arial", 22, "bold"), bg=BG, fg="#245c27"
+        ).grid(row=0, column=0, columnspan=2, pady=12)
+
+        buttons = tk.Frame(self.root, bg=BG)
+        buttons.grid(row=1, column=0, columnspan=2, pady=4)
+
+        specs = [
+            ("Upload Leaf Image", self.upload_image, "#4caf50", 17),
+            ("Start Webcam", self.start_webcam, "#2196f3", 14),
+            ("Capture & Analyse", self.capture_image, "#ff9800", 17),
+            ("Stop Webcam", self.stop_webcam, "#e53935", 14),
+            ("Save Report", self.save_report, "#0891b2", 14),
+        ]
+
+        for i, (text, cmd, colour, width) in enumerate(specs):
+            tk.Button(
+                buttons, text=text, command=cmd, font=("Arial", 11, "bold"),
+                bg=colour, fg="white", width=width
+            ).grid(row=0, column=i, padx=6)
+
+        # ---- Left: image (fixed pixel size; Label width/height are characters) ----
+        left = tk.Frame(self.root, bg=BG)
+        left.grid(row=2, column=0, padx=15, pady=8, sticky="n")
+
+        frame = tk.Frame(left, width=IMAGE_W, height=IMAGE_H, bg="white",
+                         relief="solid", bd=2)
+        frame.pack_propagate(False)
+        frame.pack()
+
+        self.image_label = tk.Label(
+            frame, bg="white", fg="#64748b", font=("Arial", 12),
+            text="No image loaded\n\nUpload a leaf image or start the webcam"
+        )
+        self.image_label.pack(expand=True, fill="both")
+
+        self.show_overlay = tk.BooleanVar(value=True)
+
+        tk.Checkbutton(
+            left, text="Highlight affected areas", variable=self.show_overlay,
+            command=self.refresh_display, bg=BG, font=("Arial", 10)
+        ).pack(anchor="w", pady=(6, 0))
+
+        tk.Label(
+            left,
+            text="Red = spots / dead tissue    Orange = yellowing    "
+                 "Blue = white coating",
+            bg=BG, fg="#475569", font=("Arial", 9)
+        ).pack(anchor="w")
+
+        # ---- Right: results ----
+        right = tk.Frame(self.root, bg=BG)
+        right.grid(row=2, column=1, padx=15, pady=8, sticky="n")
+
+        tk.Label(right, text="ANALYSIS RESULT", font=("Arial", 12, "bold"),
+                 bg=BG, fg="#245c27").pack(anchor="w")
+
+        text_frame = tk.Frame(right, bg=BG)
+        text_frame.pack()
+
+        self.result_text = tk.Text(
+            text_frame, width=58, height=27, font=("Arial", 10),
+            wrap="word", padx=8, pady=6
+        )
+        scroll = ttk.Scrollbar(text_frame, command=self.result_text.yview)
+        self.result_text.configure(yscrollcommand=scroll.set)
+
+        self.result_text.pack(side="left")
+        scroll.pack(side="right", fill="y")
+
+        self.result_text.tag_configure("title", font=("Arial", 14, "bold"))
+        self.result_text.tag_configure("head", font=("Arial", 10, "bold"),
+                                       foreground="#245c27", spacing1=8)
+        self.result_text.tag_configure("good", foreground="#15803d",
+                                       font=("Arial", 14, "bold"))
+        self.result_text.tag_configure("bad", foreground="#b91c1c",
+                                       font=("Arial", 14, "bold"))
+        self.result_text.tag_configure("warn", foreground="#b45309")
+        self.result_text.tag_configure("note", foreground="#64748b",
+                                       font=("Arial", 9, "italic"))
+
+        self.write([("Upload a leaf image or start the webcam.\n", None)])
+
+        # ---- Status ----
+        self.status_label = tk.Label(
+            self.root, text="Ready", font=("Arial", 10), bg=BG,
+            fg="#334155", wraplength=1100
+        )
+        self.status_label.grid(row=3, column=0, columnspan=2, pady=(4, 2))
+
+        self.progress = ttk.Progressbar(self.root, mode="indeterminate",
+                                        length=300)
+        self.progress.grid(row=4, column=0, columnspan=2, pady=(0, 6))
+        self.progress.grid_remove()
+
+    def set_status(self, text):
+        self.status_label.config(text=text)
+
+    def write(self, parts):
+        """parts: list of (text, tag) pairs."""
+
+        self.result_text.config(state="normal")
+        self.result_text.delete("1.0", tk.END)
+
+        for text, tag in parts:
+            if tag:
+                self.result_text.insert(tk.END, text, tag)
+            else:
+                self.result_text.insert(tk.END, text)
+
+        self.result_text.config(state="disabled")
+
+    # ------------------------------------------------------------------
+    # Image display
+    # ------------------------------------------------------------------
+
+    def display_image(self, image):
+
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+        pil.thumbnail((IMAGE_W - 6, IMAGE_H - 6))
+
+        self.photo = ImageTk.PhotoImage(pil)
+        self.image_label.configure(image=self.photo, text="")
+        self.image_label.image = self.photo
+
+    def refresh_display(self):
+
+        if self.current_image is None:
+            return
+
+        if self.heur is not None and self.show_overlay.get():
+            self.display_image(self.heur["overlay"])
+        else:
+            self.display_image(self.current_image)
+
+    # ------------------------------------------------------------------
+    # Input: upload / webcam
+    # ------------------------------------------------------------------
+
+    def upload_image(self):
+
+        self.stop_webcam()
+
+        path = filedialog.askopenfilename(
+            filetypes=[("Image Files", "*.jpg *.jpeg *.png *.bmp")]
+        )
+
+        if not path:
+            return
+
+        image = cv2.imread(path)
+
+        if image is None:
+            messagebox.showerror("Error", "Unable to open this image.")
+            return
+
+        self.analyse(image, detect_faces(image))
+
+    def start_webcam(self):
+
+        self.stop_webcam()
+
+        self.camera = cv2.VideoCapture(0)
+
+        if not self.camera.isOpened():
+            self.camera.release()
+            self.camera = None
+            messagebox.showerror(
+                "Camera Error",
+                "Unable to open webcam. Check camera permissions."
+            )
+            return
+
+        self.heur = None
+        self.set_status("Webcam running. Hold one leaf close to the camera on a "
+                        "plain background, then click Capture & Analyse.")
+
+        self.update_webcam()
+
+    def guide_box(self, frame):
+
+        h, w = frame.shape[:2]
+
+        return (int(w * GUIDE[0]), int(h * GUIDE[1]),
+                int(w * GUIDE[2]), int(h * GUIDE[3]))
+
+    @staticmethod
+    def faces_in_roi(faces, x1, y1):
+
+        return [(fx - x1, fy - y1, fw, fh) for fx, fy, fw, fh in faces]
+
+    def draw_preview(self, frame):
+        """Live view: shows exactly what is (and is not) recognised."""
+
+        display = frame.copy()
+
+        x1, y1, x2, y2 = self.guide_box(frame)
+        roi = frame[y1:y2, x1:x2]
+
+        seg = segment_leaf(
+            roi, self.faces_in_roi(self.preview_faces, x1, y1), max_side=300
+        )
+
+        # People are shown but ignored
+        for (fx, fy, fw, fh) in self.preview_faces:
+            cv2.rectangle(display, (fx, fy), (fx + fw, fy + fh),
+                          (140, 140, 140), 2)
+            draw_label(display, "Person - ignored", (fx, fy - 8),
+                       (210, 210, 210), 0.55)
+
+        cv2.rectangle(display, (x1, y1), (x2, y2), (255, 255, 255), 2)
+
+        if seg["found"]:
+            pts = (seg["contour"] / seg["scale"]).astype(np.int32) \
+                + np.array([x1, y1])
+            cv2.drawContours(display, [pts], -1, (0, 220, 0), 3)
+            draw_label(display, "Leaf detected - click Capture & Analyse",
+                       (x1, y1 - 10), (0, 230, 0))
+        else:
+            draw_label(display, "No leaf in the box - hold one green leaf inside it",
+                       (x1, y1 - 10), (0, 165, 255))
+
+        return display
+
+    def update_webcam(self):
+
+        if self.camera is None:
+            return
+
+        success, frame = self.camera.read()
+
+        if success:
+
+            self.current_image = frame.copy()
+            self.frame_count += 1
+
+            # Face detection is slower, so only every few frames
+            if self.frame_count % 6 == 1:
+                self.preview_faces = detect_faces(frame)
+
+            self.display_image(self.draw_preview(frame))
+
+        self.root.after(30, self.update_webcam)
+
+    def capture_image(self):
+
+        if self.camera is None:
+            messagebox.showwarning("Webcam", "Start the webcam first.")
+            return
+
+        success, frame = self.camera.read()
+
+        if not success:
+            messagebox.showerror("Camera Error", "Could not read a frame.")
+            return
+
+        self.stop_webcam()
+
+        faces = detect_faces(frame)
+        x1, y1, x2, y2 = self.guide_box(frame)
+
+        # Only the guide box is analysed, not the whole frame
+        roi = frame[y1:y2, x1:x2].copy()
+
+        self.analyse(roi, self.faces_in_roi(faces, x1, y1))
+
+    def stop_webcam(self):
+
+        if self.camera is not None:
+            self.camera.release()
+            self.camera = None
+
+    # ------------------------------------------------------------------
+    # Analysis
+    # ------------------------------------------------------------------
+
+    def analyse(self, image, faces=None):
+
+        self.analysis_id += 1
+        analysis_id = self.analysis_id
+
+        self.current_image = image.copy()
+
+        # Instant colour analysis, leaf only (people are excluded)
+        self.heur = analyse_lesions(image, faces)
+        self.refresh_display()
+
+        if not self.heur["leaf_found"]:
+
+            self.progress.stop()
+            self.progress.grid_remove()
+
+            self.last_result = None
+
+            self.write([
+                ("NO LEAF FOUND\n", "title"),
+                ("\nNo green leaf was detected, so nothing was analysed.\n"
+                 "Hold ONE green leaf inside the white box, on a plain, "
+                 "light background, in good light.\n", "warn"),
+                ("\nFaces, hands and skin are ignored on purpose. Only a "
+                 "green leaf is analysed.\n", "note"),
+            ])
+
+            self.set_status("No leaf detected.")
+            return
+
+        if not AI_AVAILABLE:
+            self.render(None, None, "AI model not installed. Showing colour "
+                        "analysis only. For disease names run: "
+                        "pip install transformers torch")
+            return
+
+        self.write([("Analysing the leaf with the AI model...\n", "head")])
+        self.progress.grid()
+        self.progress.start(12)
+
+        # The AI only sees the leaf (background and people are removed)
+        rgb = cv2.cvtColor(self.heur["leaf_image"], cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+        pil.thumbnail((512, 512))
+
+        threading.Thread(
+            target=self.ai_worker, args=(pil, analysis_id), daemon=True
+        ).start()
+
+    def get_classifier(self):
+
+        with self.model_lock:
+
+            if self.classifier is not None:
+                return self.classifier
+
+            if self.classifier_error is not None:
+                raise RuntimeError(self.classifier_error)
+
+            self.result_queue.put((
+                "status",
+                "Loading the disease model (first run downloads it)..."
+            ))
+
+            try:
+                self.classifier = pipeline("image-classification",
+                                           model=MODEL_ID)
+            except Exception as error:
+                self.classifier_error = str(error)
+                raise
+
+            return self.classifier
+
+    def preload_model(self):
+
+        try:
+            self.get_classifier()
+            self.result_queue.put(("ready",))
+        except Exception as error:
+            self.result_queue.put(("model_failed", str(error)))
+
+    def ai_worker(self, pil, analysis_id):
+
+        try:
+            classifier = self.get_classifier()
+            output = classifier(pil, top_k=3)
+            self.result_queue.put(("ai", analysis_id, output))
+        except Exception as error:
+            self.result_queue.put(("ai_error", analysis_id, str(error)))
+
+    def poll_queue(self):
+
+        try:
+            while True:
+
+                msg = self.result_queue.get_nowait()
+                kind = msg[0]
+
+                if kind == "status":
+                    self.set_status(msg[1])
+
+                elif kind == "ready":
+                    self.set_status("Disease model ready. Upload a leaf image.")
+
+                elif kind == "model_failed":
+                    self.set_status(
+                        "Disease model could not be loaded, so only colour "
+                        "analysis is available. Reason: " + msg[1]
+                    )
+
+                elif kind in ("ai", "ai_error"):
+
+                    if msg[1] != self.analysis_id:
+                        continue          # result for an older image
+
+                    self.progress.stop()
+                    self.progress.grid_remove()
+
+                    if kind == "ai":
+                        self.render(msg[2], None, None)
+                        self.set_status("Analysis complete.")
+                    else:
+                        self.render(None, None,
+                                    "The AI model could not run: " + msg[2])
+                        self.set_status("AI model unavailable; showing colour "
+                                        "analysis only.")
+
+        except queue.Empty:
+            pass
+
+        self.root.after(100, self.poll_queue)
+
+    # ------------------------------------------------------------------
+    # Result text
+    # ------------------------------------------------------------------
+
+    def render(self, ai_output, _unused, note):
+
+        heur = self.heur
+        parts = []
+        record = {"crop": "", "condition": "", "confidence": "",
+                  "precautions": []}
+
+        if ai_output:
+
+            top = ai_output[0]
+            crop, condition = parse_label(top["label"])
+            confidence = top["score"] * 100
+            healthy = "healthy" in condition.lower()
+
+            record["crop"] = crop
+            record["confidence"] = f"{confidence:.0f}%"
+
+            parts.append((f"Crop: {crop}\n", "title"))
+
+            if healthy:
+                parts.append(("Leaf looks HEALTHY\n", "good"))
+                record["condition"] = "Healthy"
+                info = None
+            else:
+                info = find_disease_info(top["label"])
+                shown = info[0] if info else condition
+                parts.append((f"Detected: {shown}\n", "bad"))
+                record["condition"] = shown
+
+            parts.append((f"Confidence: {confidence:.0f}%\n", None))
+
+            if confidence < 50:
+                parts.append((
+                    "Low confidence. The photo may not show a single clear leaf, "
+                    "or the crop may not be supported. Try a closer photo on a "
+                    "plain background.\n", "warn"))
+
+            parts.append(("\nOther possibilities\n", "head"))
+
+            for i, item in enumerate(ai_output, 1):
+                c, d = parse_label(item["label"])
+                parts.append((f"  {i}. {c} - {d}  "
+                              f"({item['score'] * 100:.0f}%)\n", None))
+
+            if heur:
+                parts.append(("\nDamage estimate\n", "head"))
+                parts.append((
+                    f"  Affected leaf area: {heur['affected']:.1f}%  "
+                    f"({heur['severity']})\n", None))
+
+                if healthy and heur["affected"] >= 25:
+                    parts.append((
+                        "  The model says healthy, but visible damage was found. "
+                        "It may be a pest, nutrient problem or another issue.\n",
+                        "warn"))
+
+            if healthy:
+                precautions = HEALTHY_TIPS
+                parts.append(("\nKeeping it healthy\n", "head"))
+            else:
+                if info:
+                    _, cause, symptoms, precautions = info
+                    parts.append(("\nCause\n", "head"))
+                    parts.append((f"  {cause}\n", None))
+                    parts.append(("\nTypical symptoms\n", "head"))
+                    parts.append((f"  {symptoms}\n", None))
+                else:
+                    precautions = GENERIC_PRECAUTIONS
+
+                parts.append(("\nPrecautions and treatment\n", "head"))
+
+            for p in precautions:
+                parts.append((f"  - {p}\n", None))
+
+            record["precautions"] = precautions
+
+        else:
+            # Colour analysis only
+            parts.append(("Colour analysis only\n", "title"))
+
+            if note:
+                parts.append((note + "\n", "note"))
+
+            if heur:
+
+                if not heur["leaf_found"]:
+                    parts.append((
+                        "\nThe leaf outline was not found. Use a single leaf "
+                        "on a plain, light background.\n", "warn"))
+
+                parts.append(("\nDamage estimate\n", "head"))
+                parts.append((
+                    f"  Affected leaf area: {heur['affected']:.1f}%  "
+                    f"({heur['severity']})\n"
+                    f"  Spots / dead tissue: {heur['necrosis']:.1f}%\n"
+                    f"  Yellowing: {heur['yellow']:.1f}%\n"
+                    f"  White coating: {heur['white']:.1f}%\n", None))
+
+                if not heur["issues"]:
+                    parts.append(("\nNo obvious damage found\n", "good"))
+                    precautions = HEALTHY_TIPS
+                    record["condition"] = "No obvious damage"
+                else:
+                    record["condition"] = ", ".join(heur["issues"])
+                    precautions = []
+
+                    for issue in heur["issues"]:
+                        symptoms, steps = COLOUR_ISSUES[issue]
+                        parts.append((f"\nPossible issue: {issue}\n", "head"))
+                        parts.append((f"  {symptoms}\n", None))
+                        for p in steps:
+                            if p not in precautions:
+                                precautions.append(p)
+
+                parts.append(("\nPrecautions\n", "head"))
+
+                for p in precautions:
+                    parts.append((f"  - {p}\n", None))
+
+                record["precautions"] = precautions
+
+        parts.append((
+            "\nThis is an automatic estimate, not a diagnosis. Confirm with your "
+            "local agriculture office or plant clinic before using any "
+            "chemical treatment.\n", "note"))
+
+        self.write(parts)
+
+        record["affected"] = f"{heur['affected']:.1f}" if heur else ""
+        record["severity"] = heur["severity"] if heur else ""
+        self.last_result = record
+
+    # ------------------------------------------------------------------
+    # Report
+    # ------------------------------------------------------------------
+
+    def save_report(self):
+
+        if not self.last_result:
+            messagebox.showwarning("No Result",
+                                   "Analyse a leaf image first.")
+            return
+
+        r = self.last_result
+        exists = os.path.exists(REPORT_FILE)
+        now = datetime.now()
+
+        with open(REPORT_FILE, "a", newline="", encoding="utf-8") as f:
+
+            writer = csv.writer(f)
+
+            if not exists:
+                writer.writerow([
+                    "Date", "Time", "Crop", "Condition", "Confidence",
+                    "Affected Area %", "Severity", "Precautions"
+                ])
+
+            writer.writerow([
+                now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"),
+                r["crop"], r["condition"], r["confidence"],
+                r["affected"], r["severity"], " | ".join(r["precautions"])
+            ])
+
+        messagebox.showinfo(
+            "Report Saved",
+            f"Saved to:\n{os.path.abspath(REPORT_FILE)}"
+        )
+
+    def close_app(self):
+
+        self.stop_webcam()
+        self.root.destroy()
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = LeafDiseaseApp(root)
+    root.mainloop()
+
+leaf_detection - Agriculture
+
+SMart teaching board
+"""
+SMART TEACHING BOARD  -  hand-gesture whiteboard / blackboard
+==============================================================
+
+Install:  pip install opencv-python mediapipe numpy
+Run:      python smart_teaching_board.py
+
+GESTURES (one hand, index finger is the pointer)
+  1 finger  (index only)        -> DRAW
+  2 fingers (index + middle)    -> SELECT: hold the pointer on a toolbar button
+                                   (colours, UNDO, REDO, SAVE, BOARD)
+  4 fingers (open palm)         -> ERASE
+  Fist (hold 1.5 s)             -> CLEAR current board (can be undone)
+  Anything else                 -> pen up / idle
+
+KEYS
+  1 / 2   whiteboard / blackboard      Z / Y   undo / redo
+  S       save both boards             C       clear current board
+  [ / ]   brush smaller / bigger       - / =   eraser smaller / bigger
+  H       show / hide gesture help     F       fullscreen
+  Q / ESC quit
+"""
+
+import math
+import os
+import time
+from collections import deque
+from datetime import datetime
+
+import cv2
+import numpy as np
+
+try:
+    import mediapipe as mp
+    mp_hands = mp.solutions.hands
+    mp_draw = mp.solutions.drawing_utils
+except (ImportError, AttributeError):
+    print("This script needs a MediaPipe version that still has the 'solutions' API.")
+    print("Newer MediaPipe releases removed it. Use Python 3.9-3.12 and run:")
+    print("    pip install mediapipe==0.10.14")
+    raise SystemExit(1)
+
+# ==================================================
+# CONFIGURATION  (tweak these to taste)
+# ==================================================
+
+CAMERA_INDEX = 0
+W, H = 640, 480                 # camera size AND board size
+MODEL_COMPLEXITY = 1            # 0 = faster, 1 = more accurate
+DETECT_CONF = 0.6
+TRACK_CONF = 0.6
+
+UI_H = 64                       # toolbar height on the board (no drawing here)
+MARGIN = 0.12                   # edge of camera frame that is not needed to reach the board edge
+
+BRUSH_MIN, BRUSH_MAX = 2, 30
+ERASER_MIN, ERASER_MAX = 10, 90
+
+MAX_JUMP = 140                  # ignore stroke segments longer than this (tracking glitch)
+GESTURE_FRAMES = 3              # frames a gesture must be stable before it counts
+HAND_LOSS_GRACE = 0.25          # seconds of lost tracking tolerated mid-stroke
+DWELL_TIME = 0.6                # seconds to hold on a toolbar button
+CLEAR_HOLD = 1.5                # seconds to hold a fist to clear
+UNDO_LIMIT = 25
+SAVE_DIR = "saved_boards"
+
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+WIN = "SMART TEACHING BOARD"
+
+# Colours are BGR
+WHITE_PALETTE = [(0, 0, 0), (255, 0, 0), (0, 0, 255), (0, 150, 0), (0, 140, 255)]
+WHITE_NAMES = ["BLACK", "BLUE", "RED", "GREEN", "ORANGE"]
+BLACK_PALETTE = [(255, 255, 255), (0, 255, 255), (255, 255, 0), (255, 0, 255), (0, 165, 255)]
+BLACK_NAMES = ["WHITE", "YELLOW", "CYAN", "MAGENTA", "ORANGE"]
+
+# Toolbar layout: (kind, value, centre)
+TOOLBAR = [("color", i, (40 + 68 * i, UI_H // 2)) for i in range(5)]
+TOOLBAR += [("action", label, (40 + 68 * (5 + j), UI_H // 2))
+            for j, label in enumerate(("UNDO", "REDO", "SAVE", "BOARD"))]
+
+
+# ==================================================
+# BOARD  (canvas + colour + undo/redo history)
+# ==================================================
+
+class Board:
+    def __init__(self, name, bg, palette, names):
+        self.name = name
+        self.bg = bg
+        self.palette = palette
+        self.names = names
+        self.color_idx = 0
+        self.canvas = np.empty((H, W, 3), dtype=np.uint8)
+        self.canvas[:] = bg
+        self.undo_stack = deque(maxlen=UNDO_LIMIT)
+        self.redo_stack = []
+
+    @property
+    def color(self):
+        return self.palette[self.color_idx]
+
+    def snapshot(self):
+        """Call BEFORE changing the canvas so the change can be undone."""
+        self.undo_stack.append(self.canvas.copy())
+        self.redo_stack.clear()
+
+    def undo(self):
+        if not self.undo_stack:
+            return False
+        self.redo_stack.append(self.canvas.copy())
+        self.canvas = self.undo_stack.pop()
+        return True
+
+    def redo(self):
+        if not self.redo_stack:
+            return False
+        self.undo_stack.append(self.canvas.copy())
+        self.canvas = self.redo_stack.pop()
+        return True
+
+    def clear(self):
+        self.snapshot()
+        self.canvas[:] = self.bg
+
+
+# ==================================================
+# SMOOTHING + GESTURE HELPERS
+# ==================================================
+
+class Pointer:
+    """Speed-adaptive smoothing: steady when slow, responsive when fast."""
+
+    def __init__(self):
+        self.pos = None
+
+    def reset(self):
+        self.pos = None
+
+    def update(self, p):
+        if self.pos is None:
+            self.pos = (float(p[0]), float(p[1]))
+        else:
+            dx, dy = p[0] - self.pos[0], p[1] - self.pos[1]
+            alpha = min(0.9, max(0.3, math.hypot(dx, dy) / 40.0))
+            self.pos = (self.pos[0] + dx * alpha, self.pos[1] + dy * alpha)
+        return int(round(self.pos[0])), int(round(self.pos[1]))
+
+
+class GestureFilter:
+    """A new gesture only becomes active after N consecutive identical frames."""
+
+    def __init__(self, frames=GESTURE_FRAMES):
+        self.frames = frames
+        self.reset()
+
+    def reset(self):
+        self.current = "NONE"
+        self._cand = None
+        self._count = 0
+
+    def update(self, g):
+        if g == self.current:
+            self._cand, self._count = None, 0
+        elif g == self._cand:
+            self._count += 1
+            if self._count >= self.frames:
+                self.current, self._cand, self._count = g, None, 0
+        else:
+            self._cand, self._count = g, 1
+        return self.current
+
+
+def _dist(a, b):
+    return math.hypot(a.x - b.x, a.y - b.y)
+
+
+def finger_extended(lm, tip, pip):
+    """Finger is straight if its tip is clearly farther from the wrist than its middle joint."""
+    return _dist(lm[0], lm[tip]) > _dist(lm[0], lm[pip]) * 1.1
+
+
+def detect_gesture(lm):
+    index = finger_extended(lm, 8, 6)
+    middle = finger_extended(lm, 12, 10)
+    ring = finger_extended(lm, 16, 14)
+    pinky = finger_extended(lm, 20, 18)
+
+    if index and not middle and not ring and not pinky:
+        return "DRAW"
+    if index and middle and not ring and not pinky:
+        return "SELECT"
+    if index and middle and ring and pinky:
+        return "ERASE"
+    if not (index or middle or ring or pinky):
+        return "CLEAR"
+    return "IDLE"
+
+
+def draw_segment(canvas, p0, p1, color, size, line_type=cv2.LINE_AA):
+    """Round-capped line (or a dot if p0 is None)."""
+    r = max(1, size // 2)
+    if p0 is not None:
+        cv2.line(canvas, p0, p1, color, max(1, size), line_type)
+    cv2.circle(canvas, p1, r, color, -1, line_type)
+
+
+def panel(img, x1, y1, x2, y2, alpha=0.55):
+    roi = img[y1:y2, x1:x2]
+    cv2.addWeighted(np.zeros_like(roi), alpha, roi, 1 - alpha, 0, roi)
+
+
+# ==================================================
+# APPLICATION
+# ==================================================
+
+class SmartBoard:
+    def __init__(self):
+        self.cap = None
+        self.hands = mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            model_complexity=MODEL_COMPLEXITY,
+            min_detection_confidence=DETECT_CONF,
+            min_tracking_confidence=TRACK_CONF,
+        )
+        self.boards = {
+            "WHITEBOARD": Board("WHITEBOARD", (255, 255, 255), WHITE_PALETTE, WHITE_NAMES),
+            "BLACKBOARD": Board("BLACKBOARD", (0, 0, 0), BLACK_PALETTE, BLACK_NAMES),
+        }
+        self.active = "WHITEBOARD"
+        self.brush = 7
+        self.eraser = 30
+
+        self.gestures = GestureFilter()
+        self.pointer = Pointer()
+        self.prev_gesture = "NONE"
+        self.last_pt = None
+        self.cursor = None
+        self.snapped = False
+        self.last_hand_time = 0.0
+
+        self.hover_idx = None
+        self.hover_start = 0.0
+        self.fired = False
+
+        self.clear_start = None
+        self.clear_done = False
+
+        self.toast_text = ""
+        self.toast_until = 0.0
+        self.show_help = True
+        self.fullscreen = False
+        self.fps = 0.0
+
+    # ---------- small helpers ----------
+
+    @property
+    def board(self):
+        return self.boards[self.active]
+
+    def toast(self, text, seconds=1.5):
+        self.toast_text = text
+        self.toast_until = time.time() + seconds
+
+    def reset_state(self):
+        """Called whenever the active gesture changes."""
+        self.pointer.reset()
+        self.last_pt = None
+        self.snapped = False
+        self.hover_idx = None
+        self.fired = False
+        self.clear_start = None
+        self.clear_done = False
+
+    def switch_board(self, name):
+        self.active = name
+        self.reset_state()
+        self.toast(name)
+
+    def save(self):
+        os.makedirs(SAVE_DIR, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        for name, b in self.boards.items():
+            cv2.imwrite(os.path.join(SAVE_DIR, f"{name.lower()}_{stamp}.png"), b.canvas)
+        self.toast(f"Saved to {SAVE_DIR}/")
+        print(f"Boards saved to {SAVE_DIR}/ ({stamp})")
+
+    # ---------- hand tracking ----------
+
+    def track(self, frame):
+        """Returns (gesture, raw_camera_point, board_point)."""
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb.flags.writeable = False
+        result = self.hands.process(rgb)
+
+        if result.multi_hand_landmarks:
+            hand = result.multi_hand_landmarks[0]
+            lm = hand.landmark
+            self.last_hand_time = time.time()
+            mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
+
+            raw = (int(np.clip(lm[8].x * W, 0, W - 1)), int(np.clip(lm[8].y * H, 0, H - 1)))
+            # Map the inner part of the camera frame onto the whole board
+            nx = np.clip((lm[8].x - MARGIN) / (1 - 2 * MARGIN), 0, 1)
+            ny = np.clip((lm[8].y - MARGIN) / (1 - 2 * MARGIN), 0, 1)
+            pt = (int(nx * (W - 1)), int(ny * (H - 1)))
+            return self.gestures.update(detect_gesture(lm)), raw, pt
+
+        if time.time() - self.last_hand_time > HAND_LOSS_GRACE:
+            self.gestures.reset()
+            return "NONE", None, None
+        return "HOLD", None, None       # brief dropout: keep current state
+
+    # ---------- gesture handling ----------
+
+    def handle(self, gesture, pt):
+        if gesture == "HOLD":
+            return
+        if gesture != self.prev_gesture:
+            self.reset_state()
+            self.prev_gesture = gesture
+        self.cursor = pt
+        if pt is None:
+            return
+
+        if gesture == "DRAW":
+            self.do_draw(pt)
+        elif gesture == "ERASE":
+            self.do_erase(pt)
+        elif gesture == "SELECT":
+            self.do_select(pt)
+        elif gesture == "CLEAR":
+            self.do_clear()
+
+    def _stroke_to(self, p, color, size, line_type):
+        board = self.board
+        if self.last_pt is not None and math.hypot(p[0] - self.last_pt[0], p[1] - self.last_pt[1]) > MAX_JUMP:
+            self.last_pt = None
+        if not self.snapped:
+            board.snapshot()
+            self.snapped = True
+        draw_segment(board.canvas, self.last_pt, p, color, size, line_type)
+        self.last_pt = p
+
+    def do_draw(self, pt):
+        p = self.pointer.update(pt)
+        self.cursor = p
+        if p[1] < UI_H:                       # toolbar zone: never draw under the buttons
+            self.last_pt = None
+            return
+        self._stroke_to(p, self.board.color, self.brush, cv2.LINE_AA)
+
+    def do_erase(self, pt):
+        p = self.pointer.update(pt)
+        self.cursor = p
+        self._stroke_to(p, self.board.bg, self.eraser * 2, cv2.LINE_8)
+
+    def hit_test(self, pt):
+        for i, (_, _, (x, y)) in enumerate(TOOLBAR):
+            if math.hypot(pt[0] - x, pt[1] - y) < 33:
+                return i
+        return None
+
+    def do_select(self, pt):
+        idx = self.hit_test(pt)
+        now = time.time()
+        if idx != self.hover_idx:
+            self.hover_idx, self.hover_start, self.fired = idx, now, False
+        elif idx is not None and not self.fired and now - self.hover_start >= DWELL_TIME:
+            self.activate(idx)
+            self.fired = True                 # must leave the button before it can fire again
+
+    def activate(self, idx):
+        kind, val, _ = TOOLBAR[idx]
+        board = self.board
+        if kind == "color":
+            board.color_idx = val
+            self.toast(board.names[val])
+        elif val == "UNDO":
+            self.toast("Undo" if board.undo() else "Nothing to undo")
+        elif val == "REDO":
+            self.toast("Redo" if board.redo() else "Nothing to redo")
+        elif val == "SAVE":
+            self.save()
+        elif val == "BOARD":
+            self.switch_board("BLACKBOARD" if self.active == "WHITEBOARD" else "WHITEBOARD")
+
+    def do_clear(self):
+        now = time.time()
+        if self.clear_start is None:
+            self.clear_start = now
+        elif not self.clear_done and now - self.clear_start >= CLEAR_HOLD:
+            self.board.clear()
+            self.clear_done = True
+            self.toast(f"{self.active} cleared (Z to undo)", 2.0)
+
+    # ---------- keyboard ----------
+
+    def handle_key(self, key):
+        """Returns False to quit."""
+        b = self.board
+        if key in (ord('q'), 27):
+            return False
+        if key == ord('1'):
+            self.switch_board("WHITEBOARD")
+        elif key == ord('2'):
+            self.switch_board("BLACKBOARD")
+        elif key == ord('s'):
+            self.save()
+        elif key == ord('c'):
+            b.clear()
+            self.reset_state()
+            self.toast(f"{self.active} cleared (Z to undo)", 2.0)
+        elif key == ord('z'):
+            self.toast("Undo" if b.undo() else "Nothing to undo")
+        elif key == ord('y'):
+            self.toast("Redo" if b.redo() else "Nothing to redo")
+        elif key == ord('['):
+            self.brush = max(BRUSH_MIN, self.brush - 1)
+            self.toast(f"Brush {self.brush}")
+        elif key == ord(']'):
+            self.brush = min(BRUSH_MAX, self.brush + 1)
+            self.toast(f"Brush {self.brush}")
+        elif key == ord('-'):
+            self.eraser = max(ERASER_MIN, self.eraser - 5)
+            self.toast(f"Eraser {self.eraser}")
+        elif key in (ord('='), ord('+')):
+            self.eraser = min(ERASER_MAX, self.eraser + 5)
+            self.toast(f"Eraser {self.eraser}")
+        elif key == ord('h'):
+            self.show_help = not self.show_help
+        elif key == ord('f'):
+            self.fullscreen = not self.fullscreen
+            cv2.setWindowProperty(
+                WIN, cv2.WND_PROP_FULLSCREEN,
+                cv2.WINDOW_FULLSCREEN if self.fullscreen else cv2.WINDOW_NORMAL)
+        return True
+
+    # ---------- rendering ----------
+
+    def draw_toolbar(self, view):
+        board = self.board
+        dark = board.name == "BLACKBOARD"
+        band = (40, 40, 40) if dark else (225, 225, 225)
+        fg = (255, 255, 255) if dark else (30, 30, 30)
+        btn = (80, 80, 80) if dark else (200, 200, 200)
+
+        cv2.rectangle(view, (0, 0), (W, UI_H), band, -1)
+        cv2.line(view, (0, UI_H), (W, UI_H), (120, 120, 120), 1)
+
+        now = time.time()
+        for i, (kind, val, (x, y)) in enumerate(TOOLBAR):
+            if kind == "color":
+                cv2.circle(view, (x, y), 18, board.palette[val], -1, cv2.LINE_AA)
+                cv2.circle(view, (x, y), 18, (128, 128, 128), 1, cv2.LINE_AA)
+                if val == board.color_idx:
+                    cv2.circle(view, (x, y), 24, fg, 2, cv2.LINE_AA)
+            else:
+                cv2.rectangle(view, (x - 30, y - 16), (x + 30, y + 16), btn, -1)
+                (tw, th), _ = cv2.getTextSize(val, FONT, 0.45, 1)
+                cv2.putText(view, val, (x - tw // 2, y + th // 2), FONT, 0.45, fg, 1, cv2.LINE_AA)
+
+            if i == self.hover_idx:
+                progress = 1.0 if self.fired else min(1.0, (now - self.hover_start) / DWELL_TIME)
+                ring = (0, 200, 0) if self.fired else (0, 200, 255)
+                cv2.ellipse(view, (x, y), (30, 30), -90, 0, int(progress * 360), ring, 3, cv2.LINE_AA)
+
+    def render_board(self, mode):
+        board = self.board
+        view = board.canvas.copy()
+        self.draw_toolbar(view)
+        dark = board.name == "BLACKBOARD"
+        outline = (200, 200, 200) if dark else (90, 90, 90)
+
+        if self.cursor is not None:
+            cx, cy = self.cursor
+            if mode == "DRAW":
+                cv2.circle(view, (cx, cy), max(1, self.brush // 2), board.color, -1, cv2.LINE_AA)
+                cv2.circle(view, (cx, cy), self.brush // 2 + 4, outline, 1, cv2.LINE_AA)
+            elif mode == "ERASE":
+                cv2.circle(view, (cx, cy), self.eraser, (0, 140, 255), 2, cv2.LINE_AA)
+            elif mode == "SELECT":
+                cv2.circle(view, (cx, cy), 12, (0, 200, 255), 2, cv2.LINE_AA)
+                cv2.circle(view, (cx, cy), 2, (0, 200, 255), -1, cv2.LINE_AA)
+            elif mode == "IDLE":
+                cv2.circle(view, (cx, cy), 6, outline, 1, cv2.LINE_AA)
+
+        # clear progress bar
+        if mode == "CLEAR" and self.clear_start is not None:
+            frac = 1.0 if self.clear_done else min(1.0, (time.time() - self.clear_start) / CLEAR_HOLD)
+            x0, y0, bw = W // 2 - 110, H - 50, 220
+            cv2.rectangle(view, (x0, y0), (x0 + bw, y0 + 14), (120, 120, 120), 1)
+            cv2.rectangle(view, (x0, y0), (x0 + int(bw * frac), y0 + 14), (0, 0, 255), -1)
+            cv2.putText(view, "CLEARING..." if not self.clear_done else "CLEARED",
+                        (x0, y0 - 8), FONT, 0.5, outline, 1, cv2.LINE_AA)
+
+        # toast message
+        if time.time() < self.toast_until:
+            (tw, th), _ = cv2.getTextSize(self.toast_text, FONT, 0.6, 2)
+            tx, ty = W // 2 - tw // 2, H - 15
+            cv2.rectangle(view, (tx - 8, ty - th - 8), (tx + tw + 8, ty + 8), (40, 40, 40), -1)
+            cv2.putText(view, self.toast_text, (tx, ty), FONT, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+        return view
+
+    def mode_text(self, mode):
+        if mode == "DRAW":
+            return f"DRAWING (brush {self.brush})"
+        if mode == "SELECT":
+            return "SELECT: hold on a button"
+        if mode == "ERASE":
+            return f"ERASER (size {self.eraser})"
+        if mode == "CLEAR":
+            if self.clear_done:
+                return "BOARD CLEARED"
+            if self.clear_start is not None:
+                return f"HOLD TO CLEAR: {max(0.0, CLEAR_HOLD - (time.time() - self.clear_start)):.1f}s"
+        if mode == "NONE":
+            return "NO HAND"
+        return "PEN UP"
+
+    def compose(self, camera, raw_pt):
+        mode = self.prev_gesture
+
+        # camera side: reach area, fingertip, optional help
+        x1, y1, x2, y2 = int(MARGIN * W), int(MARGIN * H), int((1 - MARGIN) * W), int((1 - MARGIN) * H)
+        cv2.rectangle(camera, (x1, y1), (x2, y2), (255, 200, 0), 1)
+        if raw_pt is not None:
+            cv2.circle(camera, raw_pt, 8, (0, 255, 0), -1)
+        if self.show_help:
+            panel(camera, 6, 6, 320, 124)
+            lines = ["DRAW   : 1 finger (index)",
+                     "BUTTONS: 2 fingers, hold on a button",
+                     "ERASE  : 4 fingers (open palm)",
+                     "CLEAR  : fist, hold 1.5 s",
+                     "Blue box = area that maps to the board"]
+            for i, t in enumerate(lines):
+                cv2.putText(camera, t, (14, 28 + 20 * i), FONT, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+
+        view = self.render_board(mode)
+        combined = np.hstack((camera, view))
+
+        footer = np.zeros((58, 2 * W, 3), dtype=np.uint8)
+        cv2.putText(footer, f"{self.active}   |   MODE: {self.mode_text(mode)}   |   FPS: {int(self.fps)}",
+                    (15, 23), FONT, 0.55, (0, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(footer,
+                    "1/2 Board   Z Undo   Y Redo   S Save   C Clear   [ ] Brush   - = Eraser   H Help   F Fullscreen   Q Quit",
+                    (15, 47), FONT, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+        return np.vstack((combined, footer))
+
+    # ---------- main loop ----------
+
+    def open_camera(self):
+        cap = cv2.VideoCapture(CAMERA_INDEX)
+        if not cap.isOpened():
+            print("Camera not found! Try another CAMERA_INDEX at the top of the file.")
+            raise SystemExit(1)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, W)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # lower latency
+        return cap
+
+    def run(self):
+        self.cap = self.open_camera()
+        cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(WIN, 2 * W, H + 58)
+        prev = time.time()
+        try:
+            while True:
+                ok, frame = self.cap.read()
+                if not ok:
+                    print("Camera frame error!")
+                    break
+                frame = cv2.resize(cv2.flip(frame, 1), (W, H))
+
+                gesture, raw, pt = self.track(frame)
+                self.handle(gesture, pt)
+
+                now = time.time()
+                self.fps = 0.9 * self.fps + 0.1 / max(now - prev, 1e-3)
+                prev = now
+
+                cv2.imshow(WIN, self.compose(frame, raw))
+                if not self.handle_key(cv2.waitKey(1) & 0xFF):
+                    break
+                if cv2.getWindowProperty(WIN, cv2.WND_PROP_VISIBLE) < 1:
+                    break                      # window closed with the X button
+        finally:
+            self.cap.release()
+            self.hands.close()
+            cv2.destroyAllWindows()
+            print("Smart Teaching Board closed")
+
+
+if __name__ == "__main__":
+    SmartBoard().run()
+
+Student Mointoring
+
+import cv2
+import mediapipe as mp
+import time
+import math
+
+# ============================================================
+# MULTI-STUDENT CLASSROOM ATTENTION MONITOR
+# ============================================================
+
+# CONFIGURATION
+MAX_STUDENTS = 30
+
+CAMERA_WIDTH = 1920
+CAMERA_HEIGHT = 1080
+PROCESS_WIDTH = 1280
+
+EAR_THRESHOLD = 0.21
+MAR_THRESHOLD = 0.65
+
+DROWSY_TIME = 1.5
+YAWN_TIME = 0.8
+
+TRACK_TIMEOUT = 6.0
+
+MAX_CENTER_DISTANCE_IN_FACE_WIDTHS = 1.8
+MIN_IOU_FOR_MATCH = 0.02
+
+# MEDIAPIPE INITIALIZATION
+mp_face_mesh = mp.solutions.face_mesh
+
+face_mesh = mp_face_mesh.FaceMesh(
+    static_image_mode=False,
+    max_num_faces=MAX_STUDENTS,
+    refine_landmarks=True,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
+
+# WEBCAM INITIALIZATION
+cap = cv2.VideoCapture(0)
+
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+
+if not cap.isOpened():
+    print("ERROR: Webcam not found!")
+    face_mesh.close()
+    raise SystemExit
+
+# TRACKING VARIABLES
+student_states = {}
+next_student_id = 1
+
+total_blinks = 0
+total_yawns = 0
+
+session_start = time.time()
+
+
+# ============================================================
+# UTILITY FUNCTIONS
+# ============================================================
+
+def distance(p1, p2):
+    return math.hypot(
+        p1[0] - p2[0],
+        p1[1] - p2[1]
+    )
+
+
+def create_student(center, bbox, now):
+    return {
+        "center": center,
+        "previous_center": center,
+        "bbox": bbox,
+        "velocity": (0.0, 0.0),
+        "last_seen": now,
+
+        "closed_since": None,
+        "yawn_since": None,
+
+        "eyes_closed": False,
+        "yawn_counted": False,
+
+        "blinks": 0,
+        "yawns": 0
+    }
+
+
+def box_iou(box_a, box_b):
+
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+
+    iw = max(0, ix2 - ix1)
+    ih = max(0, iy2 - iy1)
+
+    intersection = iw * ih
+
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+
+    union = area_a + area_b - intersection
+
+    if union == 0:
+        return 0.0
+
+    return intersection / union
+
+
+def predicted_center(state, now):
+
+    dt = max(0.0, now - state["last_seen"])
+
+    vx, vy = state["velocity"]
+    cx, cy = state["center"]
+
+    return (
+        cx + vx * dt,
+        cy + vy * dt
+    )
+
+
+def match_cost(state, detection, now):
+
+    predicted = predicted_center(state, now)
+
+    detected_center = detection["center"]
+
+    dist = distance(
+        predicted,
+        detected_center
+    )
+
+    old_box = state["bbox"]
+    new_box = detection["bbox"]
+
+    old_width = max(
+        1,
+        old_box[2] - old_box[0]
+    )
+
+    new_width = max(
+        1,
+        new_box[2] - new_box[0]
+    )
+
+    reference_width = max(
+        old_width,
+        new_width
+    )
+
+    normalized_distance = dist / reference_width
+
+    overlap = box_iou(
+        old_box,
+        new_box
+    )
+
+    if (
+        normalized_distance > MAX_CENTER_DISTANCE_IN_FACE_WIDTHS
+        and overlap < MIN_IOU_FOR_MATCH
+    ):
+        return None
+
+    return (
+        0.70 * min(normalized_distance, 3.0)
+        + 0.30 * (1.0 - overlap)
+    )
+
+
+def update_track(state, detection, now):
+
+    old_center = state["center"]
+    old_time = state["last_seen"]
+
+    new_center = detection["center"]
+
+    dt = max(
+        now - old_time,
+        0.001
+    )
+
+    measured_vx = (
+        new_center[0] - old_center[0]
+    ) / dt
+
+    measured_vy = (
+        new_center[1] - old_center[1]
+    ) / dt
+
+    old_vx, old_vy = state["velocity"]
+
+    alpha = 0.55
+
+    state["velocity"] = (
+        alpha * measured_vx + (1 - alpha) * old_vx,
+        alpha * measured_vy + (1 - alpha) * old_vy
+    )
+
+    state["previous_center"] = old_center
+
+    state["center"] = new_center
+    state["bbox"] = detection["bbox"]
+    state["last_seen"] = now
+
+
+# ============================================================
+# IMPROVED MULTI-STUDENT TRACKING
+# ============================================================
+
+def assign_detections(detections, now):
+
+    global next_student_id
+
+    active_ids = [
+        sid
+        for sid, state in student_states.items()
+        if now - state["last_seen"] <= TRACK_TIMEOUT
+    ]
+
+    possible_matches = []
+
+    for sid in active_ids:
+
+        state = student_states[sid]
+
+        for detection_index, detection in enumerate(detections):
+
+            cost = match_cost(
+                state,
+                detection,
+                now
+            )
+
+            if cost is not None:
+
+                possible_matches.append(
+                    (cost, sid, detection_index)
+                )
+
+    # Lowest-cost matches are selected first.
+    possible_matches.sort(
+        key=lambda item: item[0]
+    )
+
+    used_ids = set()
+    used_detections = set()
+
+    assignments = {}
+
+    for cost, sid, detection_index in possible_matches:
+
+        if sid in used_ids:
+            continue
+
+        if detection_index in used_detections:
+            continue
+
+        used_ids.add(sid)
+        used_detections.add(detection_index)
+
+        assignments[detection_index] = sid
+
+        update_track(
+            student_states[sid],
+            detections[detection_index],
+            now
+        )
+
+    # Create new IDs for unmatched faces.
+    for detection_index, detection in enumerate(detections):
+
+        if detection_index not in used_detections:
+
+            sid = next_student_id
+            next_student_id += 1
+
+            student_states[sid] = create_student(
+                detection["center"],
+                detection["bbox"],
+                now
+            )
+
+            assignments[detection_index] = sid
+
+    # Remove expired student records.
+    expired_ids = [
+        sid
+        for sid, state in student_states.items()
+        if now - state["last_seen"] > TRACK_TIMEOUT
+    ]
+
+    for sid in expired_ids:
+        del student_states[sid]
+
+    return assignments
+
+
+# ============================================================
+# EYE ASPECT RATIO (EAR)
+# ============================================================
+
+def calculate_ear(lm, w, h):
+
+    left_eye = [
+        362, 385, 387, 263, 373, 380
+    ]
+
+    right_eye = [
+        33, 160, 158, 133, 153, 144
+    ]
+
+    def eye_ratio(indices):
+
+        points = [
+            (lm[i].x * w, lm[i].y * h)
+            for i in indices
+        ]
+
+        vertical1 = distance(
+            points[1],
+            points[5]
+        )
+
+        vertical2 = distance(
+            points[2],
+            points[4]
+        )
+
+        horizontal = distance(
+            points[0],
+            points[3]
+        )
+
+        if horizontal == 0:
+            return 0.0
+
+        return (
+            vertical1 + vertical2
+        ) / (2.0 * horizontal)
+
+    return (
+        eye_ratio(left_eye)
+        + eye_ratio(right_eye)
+    ) / 2.0
+
+
+# ============================================================
+# MOUTH ASPECT RATIO (MAR)
+# ============================================================
+
+def calculate_mar(lm, w, h):
+
+    top = (
+        lm[13].x * w,
+        lm[13].y * h
+    )
+
+    bottom = (
+        lm[14].x * w,
+        lm[14].y * h
+    )
+
+    left = (
+        lm[78].x * w,
+        lm[78].y * h
+    )
+
+    right = (
+        lm[308].x * w,
+        lm[308].y * h
+    )
+
+    vertical = distance(
+        top,
+        bottom
+    )
+
+    horizontal = distance(
+        left,
+        right
+    )
+
+    if horizontal == 0:
+        return 0.0
+
+    return vertical / horizontal
+
+
+# ============================================================
+# DRAW TEXT
+# ============================================================
+
+def draw_text(
+    frame,
+    text,
+    position,
+    color=(255, 255, 255),
+    scale=0.55
+):
+
+    cv2.putText(
+        frame,
+        text,
+        position,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        color,
+        2,
+        cv2.LINE_AA
+    )
+
+
+# ============================================================
+# MAIN MONITORING
+# ============================================================
+
+previous_time = time.time()
+
+try:
+
+    while True:
+
+        success, original_frame = cap.read()
+
+        if not success:
+            print("Unable to read webcam!")
+            break
+
+        original_frame = cv2.flip(
+            original_frame,
+            1
+        )
+
+        original_h, original_w = original_frame.shape[:2]
+
+        scale = PROCESS_WIDTH / original_w
+
+        process_h = int(
+            original_h * scale
+        )
+
+        frame = cv2.resize(
+            original_frame,
+            (PROCESS_WIDTH, process_h)
+        )
+
+        h, w = frame.shape[:2]
+
+        rgb = cv2.cvtColor(
+            frame,
+            cv2.COLOR_BGR2RGB
+        )
+
+        results = face_mesh.process(rgb)
+
+        now = time.time()
+
+        fps = 1.0 / max(
+            now - previous_time,
+            0.001
+        )
+
+        previous_time = now
+
+        # COLLECT ALL DETECTED FACES
+
+        detections = []
+
+        faces = results.multi_face_landmarks or []
+
+        for face in faces:
+
+            lm = face.landmark
+
+            xs = [
+                int(point.x * w)
+                for point in lm
+            ]
+
+            ys = [
+                int(point.y * h)
+                for point in lm
+            ]
+
+            x1 = max(0, min(xs))
+            y1 = max(0, min(ys))
+
+            x2 = min(w - 1, max(xs))
+            y2 = min(h - 1, max(ys))
+
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            center = (
+                (x1 + x2) // 2,
+                (y1 + y2) // 2
+            )
+
+            detections.append({
+                "landmarks": lm,
+                "bbox": (x1, y1, x2, y2),
+                "center": center
+            })
+
+        assignments = assign_detections(
+            detections,
+            now
+        )
+
+        detected_faces = len(detections)
+
+        screen_oriented = 0
+        drowsy_count = 0
+        looking_away_count = 0
+
+        # PROCESS EACH STUDENT
+
+        for detection_index, detection in enumerate(detections):
+
+            lm = detection["landmarks"]
+
+            x1, y1, x2, y2 = detection["bbox"]
+
+            student_id = assignments[detection_index]
+
+            state = student_states[student_id]
+
+            # ---------------------------------
+            # BLINK DETECTION
+            # ---------------------------------
+
+            ear = calculate_ear(
+                lm,
+                w,
+                h
+            )
+
+            eyes_closed = ear < EAR_THRESHOLD
+
+            if eyes_closed:
+
+                if state["closed_since"] is None:
+                    state["closed_since"] = now
+
+                closed_duration = (
+                    now - state["closed_since"]
+                )
+
+                if closed_duration >= DROWSY_TIME:
+
+                    eye_status = "POSSIBLE DROWSINESS"
+
+                    drowsy_count += 1
+
+                else:
+
+                    eye_status = "EYES CLOSING"
+
+            else:
+
+                eye_status = "EYES OPEN"
+
+                # Count when eyes reopen.
+                if state["eyes_closed"]:
+
+                    state["blinks"] += 1
+
+                    global_blink_increment = 1
+
+                    total_blinks += global_blink_increment
+
+                state["closed_since"] = None
+
+            state["eyes_closed"] = eyes_closed
+
+            # ---------------------------------
+            # YAWN DETECTION
+            # ---------------------------------
+
+            mar = calculate_mar(
+                lm,
+                w,
+                h
+            )
+
+            mouth_open = mar > MAR_THRESHOLD
+
+            if mouth_open:
+
+                if state["yawn_since"] is None:
+                    state["yawn_since"] = now
+
+                open_duration = (
+                    now - state["yawn_since"]
+                )
+
+                if (
+                    open_duration >= YAWN_TIME
+                    and not state["yawn_counted"]
+                ):
+
+                    state["yawns"] += 1
+
+                    total_yawns += 1
+
+                    state["yawn_counted"] = True
+
+            else:
+
+                state["yawn_since"] = None
+
+                state["yawn_counted"] = False
+
+            # ---------------------------------
+            # HEAD DIRECTION
+            # ---------------------------------
+
+            left_eye_x = lm[33].x * w
+            right_eye_x = lm[263].x * w
+
+            nose_x = lm[1].x * w
+
+            eye_center = (
+                left_eye_x + right_eye_x
+            ) / 2.0
+
+            face_width = max(
+                abs(right_eye_x - left_eye_x),
+                1.0
+            )
+
+            deviation = abs(
+                nose_x - eye_center
+            ) / face_width
+
+            head_status = (
+                "TURNED"
+                if deviation > 0.25
+                else "FORWARD"
+            )
+
+            # ---------------------------------
+            # STUDENT STATUS
+            # ---------------------------------
+
+            if eye_status == "POSSIBLE DROWSINESS":
+
+                status = "POSSIBLE DROWSINESS"
+
+                color = (0, 0, 255)
+
+            elif head_status == "TURNED":
+
+                status = "HEAD TURNED"
+
+                color = (0, 165, 255)
+
+                looking_away_count += 1
+
+            elif eyes_closed:
+
+                status = "BLINKING"
+
+                color = (0, 255, 255)
+
+            else:
+
+                status = "SCREEN ORIENTED"
+
+                color = (0, 255, 0)
+
+                screen_oriented += 1
+
+            # ---------------------------------
+            # DRAW STUDENT INFORMATION
+            # ---------------------------------
+
+            cv2.rectangle(
+                frame,
+                (x1, y1),
+                (x2, y2),
+                color,
+                2
+            )
+
+            draw_text(
+                frame,
+                f"Student {student_id}: {status}",
+                (x1, max(y1 - 12, 20)),
+                color,
+                0.45
+            )
+
+            draw_text(
+                frame,
+                f"Blinks: {state['blinks']}  Yawns: {state['yawns']}",
+                (x1, min(y2 + 20, h - 10)),
+                (255, 255, 255),
+                0.45
+            )
+
+        # ====================================================
+        # CLASSROOM DASHBOARD
+        # ====================================================
+
+        dashboard_height = 180
+
+        overlay = frame.copy()
+
+        cv2.rectangle(
+            overlay,
+            (0, 0),
+            (w, dashboard_height),
+            (25, 25, 25),
+            -1
+        )
+
+        frame = cv2.addWeighted(
+            overlay,
+            0.80,
+            frame,
+            0.20,
+            0
+        )
+
+        draw_text(
+            frame,
+            "AI CLASSROOM STUDENT MONITOR",
+            (20, 30),
+            (0, 255, 255),
+            0.7
+        )
+
+        draw_text(
+            frame,
+            f"Students detected: {detected_faces}",
+            (20, 65)
+        )
+
+        draw_text(
+            frame,
+            f"Screen oriented: {screen_oriented}",
+            (20, 95),
+            (0, 255, 0)
+        )
+
+        draw_text(
+            frame,
+            f"Head turned: {looking_away_count}",
+            (20, 125),
+            (0, 165, 255)
+        )
+
+        draw_text(
+            frame,
+            f"Possible drowsiness: {drowsy_count}",
+            (20, 155),
+            (0, 0, 255)
+        )
+
+        draw_text(
+            frame,
+            f"Total blinks: {total_blinks} | Total yawns: {total_yawns}",
+            (w // 2, 65)
+        )
+
+        draw_text(
+            frame,
+            f"FPS: {fps:.1f}",
+            (w // 2, 95)
+        )
+
+        session = int(
+            time.time() - session_start
+        )
+
+        draw_text(
+            frame,
+            f"Session: {session // 60:02d}:{session % 60:02d}",
+            (w // 2, 125)
+        )
+
+        draw_text(
+            frame,
+            f"Tracking timeout: {TRACK_TIMEOUT:.0f}s",
+            (w // 2, 155)
+        )
+
+        # DISPLAY
+
+        cv2.imshow(
+            "Multi-Student Attention Monitoring System",
+            frame
+        )
+
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord("q"):
+
+            break
+
+        elif key == ord("r"):
+
+            total_blinks = 0
+            total_yawns = 0
+
+            for state in student_states.values():
+
+                state["blinks"] = 0
+                state["yawns"] = 0
+
+                state["closed_since"] = None
+                state["yawn_since"] = None
+
+                state["eyes_closed"] = False
+                state["yawn_counted"] = False
+
+            session_start = time.time()
+
+            print("Classroom statistics reset!")
+
+
+finally:
+
+    cap.release()
+
+    cv2.destroyAllWindows()
+
+    face_mesh.close()
+
+    print("\n========== CLASSROOM SUMMARY ==========")
+
+    print("Total blinks:", total_blinks)
+    print("Total yawns:", total_yawns)
+
+    print("\nIndividual student counts:")
+
+    for sid, state in sorted(student_states.items()):
+
+        print(
+            f"Student {sid}: "
+            f"Blinks={state['blinks']}, "
+            f"Yawns={state['yawns']}"
+        )
+
+    print(
+        "Session duration:",
+        int(time.time() - session_start),
+        "seconds"
+    )
+
+    print("Monitoring stopped.")
+
+Food tracking
+food tracking calories
+import cv2
+import numpy as np
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk, simpledialog
+from PIL import Image, ImageTk
+import pandas as pd
+from datetime import datetime
+import os
+import time
+import queue
+import threading
+import base64
+import json
+import re
+
+# Install requirements if needed:
+#   pip install opencv-python pillow pandas numpy ultralytics
+#
+# Optional slower fallback (used automatically if the fast detector fails):
+#   pip install transformers torch
+#
+# TWO WAYS TO DETECT
+#   * 'AI Estimate (fast)' button: sends the photo to a cloud vision AI (Claude).
+#     Takes a few seconds, recognises any food, and estimates the weight too.
+#     Needs: pip install anthropic, an API key and an internet connection.
+#   * 'Re-detect' button: the local detector below (no internet after the first
+#     download, but slower and limited to the foods in the database).
+#
+# SPEED (local detector)
+#   * The detector loads in the background when the app starts.
+#   * Detection runs in a background thread, so the window never freezes.
+#   * Fast engine: YOLO-World (usually well under a second on a CPU after loading).
+#   * Fallback engine: OWL-ViT (slower, a few seconds per image).
+#   * Results are cached, so moving the Sensitivity slider is instant.
+
+try:
+    from ultralytics import YOLOWorld
+    YOLOWORLD_AVAILABLE = True
+except Exception:
+    YOLOWorld = None
+    YOLOWORLD_AVAILABLE = False
+
+try:
+    from transformers import pipeline
+    OWL_AVAILABLE = True
+except Exception:
+    pipeline = None
+    OWL_AVAILABLE = False
+
+# Cloud estimate (fast): a vision AI reads the photo and returns each food,
+# an estimated weight and calories.   pip install anthropic
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except Exception:
+    anthropic = None
+    ANTHROPIC_AVAILABLE = False
+
+# ==========================================
+# FOOD DATABASE
+# Calories per 100 grams (approximate)
+# ==========================================
+
+FOOD_DATA = {
+    "Apple": {"calories": 52, "category": "Fruit"},
+    "Banana": {"calories": 89, "category": "Fruit"},
+    "Orange": {"calories": 47, "category": "Fruit"},
+    "Mango": {"calories": 60, "category": "Fruit"},
+    "Grapes": {"calories": 69, "category": "Fruit"},
+    "Watermelon": {"calories": 30, "category": "Fruit"},
+    "Rice": {"calories": 130, "category": "Grains"},
+    "Chapati": {"calories": 297, "category": "Grains"},
+    "Bread": {"calories": 265, "category": "Grains"},
+    "Dosa": {"calories": 168, "category": "Indian Food"},
+    "Idli": {"calories": 58, "category": "Indian Food"},
+    "Poha": {"calories": 130, "category": "Indian Food"},
+    "Egg": {"calories": 155, "category": "Protein"},
+    "Chicken": {"calories": 239, "category": "Protein"},
+    "Fish": {"calories": 206, "category": "Protein"},
+    "Potato": {"calories": 77, "category": "Vegetable"},
+    "Tomato": {"calories": 18, "category": "Vegetable"},
+    "Carrot": {"calories": 41, "category": "Vegetable"},
+    "Broccoli": {"calories": 34, "category": "Vegetable"}
+}
+
+# Clearer names for the fast detector
+YW_NAMES = {
+    "Orange": "orange fruit",
+    "Rice": "cooked rice",
+    "Chapati": "chapati flatbread",
+    "Chicken": "cooked chicken",
+    "Fish": "cooked fish",
+}
+
+# Clearer prompts for the fallback (OWL-ViT) detector
+PROMPT_OVERRIDES = {
+    "Grapes": "a photo of a bunch of grapes",
+    "Rice": "a photo of a bowl of cooked rice",
+    "Egg": "a photo of an egg",
+    "Chapati": "a photo of chapati flatbread",
+    "Dosa": "a photo of a dosa",
+    "Idli": "a photo of idli",
+    "Poha": "a photo of poha",
+    "Chicken": "a photo of cooked chicken",
+    "Fish": "a photo of cooked fish",
+    "Orange": "a photo of an orange fruit",
+}
+
+# ==========================================
+# SETTINGS
+# ==========================================
+
+YW_MODEL = "yolov8s-worldv2.pt"                  # small download (~25 MB)
+OWL_MODEL = "google/owlvit-base-patch32"         # fallback, ~600 MB
+DETECT_MAX_SIDE = 640                            # images are shrunk for speed
+YW_IMGSZ = 512                                   # YOLO-World input size (smaller = faster)
+RAW_THRESHOLD = 0.03                             # keep everything, filter later
+DEFAULT_SENSITIVITY = {"YOLO-World": 0.15, "OWL-ViT": 0.12}
+DEFAULT_QTY = 100.0
+
+# Cloud estimate settings
+CLOUD_MODEL = "claude-haiku-5-5"   # fast and low cost; "claude-sonnet-5-5" is more accurate
+CLOUD_MAX_SIDE = 1024               # photo is shrunk to this size before upload
+
+# Local detector behaviour
+AUTO_DETECT_ON_UPLOAD = False       # True = run the slower local detector on every upload
+PRELOAD_LOCAL_MODEL = False         # True = load the local model when the app starts
+
+SCOPES = ["Fruits & Vegetables", "Fruits only", "Vegetables only", "All foods"]
+
+IMAGE_W = 600
+IMAGE_H = 320
+BG = "#edf2f7"
+REPORT_FILE = "food_tracking_report.csv"
+
+BOX_COLORS = [
+    (0, 0, 220), (0, 160, 0), (220, 100, 0), (0, 150, 255),
+    (180, 0, 180), (0, 200, 200), (120, 80, 0), (60, 60, 60)
+]
+
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+# ==========================================
+# GLOBAL VARIABLES
+# ==========================================
+
+camera = None
+camera_running = False
+uploaded_image = None
+display_base = None          # shrunk copy used for fast redraws
+display_scale = 1.0
+display_photo = None
+total_calories = 0
+food_history = []
+detections = []              # list of {"food", "conf", "box", "qty"}
+
+# detection engine state
+model_lock = threading.Lock()
+engine_name = None           # "YOLO-World" or "OWL-ViT"
+yw_model = None
+yw_classes = None
+owl_pipe = None
+result_queue = queue.Queue()
+
+# detection state
+busy = False
+session_api_key = None   # kept in memory only, never saved to disk
+image_version = 0
+raw_cache = {}               # (image_version, scope) -> (engine, raw list)
+current_raw = None
+current_engine = None
+slider_lock = False
+last_engine_for_slider = None
+
+
+# ==========================================
+# CALORIE CALCULATION
+# ==========================================
+
+def calculate_calories(food, quantity):
+
+    calories_per_100g = FOOD_DATA[food]["calories"]
+
+    return round((calories_per_100g * quantity) / 100, 2)
+
+
+def item_kcal(d):
+    """Calories for one detected item (cloud items carry their own kcal/100 g)."""
+
+    if d.get("kcal100") is not None:
+        return round(d["kcal100"] * d["qty"] / 100, 2)
+
+    return calculate_calories(d["food"], d["qty"])
+
+
+# ==========================================
+# DISPLAY IMAGE IN COLOUR
+# ==========================================
+
+def display_image(frame):
+
+    global display_photo
+
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    image = Image.fromarray(rgb)
+
+    image.thumbnail((IMAGE_W, IMAGE_H))
+
+    display_photo = ImageTk.PhotoImage(image)
+
+    image_display.config(image=display_photo, text="")
+    image_display.image = display_photo
+
+
+# ==========================================
+# DETECTION ENGINES (run in background threads)
+# ==========================================
+
+def foods_for_scope(scope):
+
+    if scope == "Fruits only":
+        wanted = ("Fruit",)
+    elif scope == "Vegetables only":
+        wanted = ("Vegetable",)
+    elif scope == "Fruits & Vegetables":
+        wanted = ("Fruit", "Vegetable")
+    else:
+        return list(FOOD_DATA.keys())
+
+    return [f for f, d in FOOD_DATA.items() if d["category"] in wanted]
+
+
+def prompt_for(food):
+
+    if food in PROMPT_OVERRIDES:
+        return PROMPT_OVERRIDES[food]
+
+    article = "an" if food[0].lower() in "aeiou" else "a"
+
+    return f"a photo of {article} {food.lower()}"
+
+
+def get_engine():
+    """Load the detector once (thread-safe). Tries the fast engine first."""
+
+    global engine_name, yw_model, yw_classes, owl_pipe
+
+    with model_lock:
+
+        if engine_name:
+            return engine_name
+
+        errors = []
+
+        if YOLOWORLD_AVAILABLE:
+            try:
+                result_queue.put((
+                    "status",
+                    "Loading fast detector (YOLO-World). "
+                    "The first run downloads some files..."
+                ))
+                yw_model = YOLOWorld(YW_MODEL)
+                yw_model.set_classes(["apple"])      # loads the text encoder now
+                yw_classes = ["apple"]
+                engine_name = "YOLO-World"
+                return engine_name
+            except Exception as error:
+                yw_model = None
+                errors.append(f"YOLO-World: {error}")
+
+        if OWL_AVAILABLE:
+            try:
+                result_queue.put((
+                    "status",
+                    "Loading fallback detector (OWL-ViT). "
+                    "The first run downloads about 600 MB..."
+                ))
+
+                device = -1
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        device = 0
+                except Exception:
+                    pass
+
+                owl_pipe = pipeline(
+                    "zero-shot-object-detection",
+                    model=OWL_MODEL,
+                    device=device
+                )
+                engine_name = "OWL-ViT"
+                return engine_name
+            except Exception as error:
+                owl_pipe = None
+                errors.append(f"OWL-ViT: {error}")
+
+        raise RuntimeError(
+            "Could not load a detector.\n\n" + "\n".join(errors) +
+            "\n\nInstall with:  pip install ultralytics"
+        )
+
+
+def yoloworld_detect(small, foods):
+
+    global yw_classes
+
+    names = [YW_NAMES.get(f, f.lower()) for f in foods]
+
+    if yw_classes != names:
+        yw_model.set_classes(names)
+        yw_classes = names
+
+    name_to_food = dict(zip(names, foods))
+
+    result = yw_model.predict(
+        small, conf=RAW_THRESHOLD, imgsz=YW_IMGSZ, verbose=False
+    )[0]
+
+    raw = []
+
+    for box in result.boxes:
+
+        food = name_to_food.get(result.names[int(box.cls[0])])
+
+        if food is None:
+            continue
+
+        x1, y1, x2, y2 = [float(v) for v in box.xyxy[0].tolist()]
+
+        raw.append({"food": food, "conf": float(box.conf[0]),
+                    "box": (x1, y1, x2, y2)})
+
+    return raw
+
+
+def owl_detect(small, foods):
+
+    prompt_to_food = {prompt_for(f): f for f in foods}
+
+    pil = Image.fromarray(cv2.cvtColor(small, cv2.COLOR_BGR2RGB))
+
+    results = owl_pipe(
+        pil,
+        candidate_labels=list(prompt_to_food.keys()),
+        threshold=RAW_THRESHOLD
+    )
+
+    raw = []
+
+    for r in results:
+
+        food = prompt_to_food.get(r["label"])
+
+        if food is None:
+            continue
+
+        b = r["box"]
+
+        raw.append({"food": food, "conf": float(r["score"]),
+                    "box": (b["xmin"], b["ymin"], b["xmax"], b["ymax"])})
+
+    return raw
+
+
+def detect_raw(bgr, scope):
+    """Runs in a worker thread. Returns (engine, raw detections)."""
+
+    t0 = time.time()
+    engine = get_engine()
+    t_model = time.time() - t0
+
+    foods = foods_for_scope(scope)
+
+    H, W = bgr.shape[:2]
+    scale = min(1.0, DETECT_MAX_SIDE / max(H, W))
+
+    small = cv2.resize(bgr, None, fx=scale, fy=scale,
+                       interpolation=cv2.INTER_AREA) if scale < 1 else bgr
+
+    if engine == "YOLO-World":
+        raw = yoloworld_detect(small, foods)
+    else:
+        raw = owl_detect(small, foods)
+
+    # Boxes back to the original image size
+    for r in raw:
+        x1, y1, x2, y2 = r["box"]
+        r["box"] = (
+            max(0, int(x1 / scale)), max(0, int(y1 / scale)),
+            min(W, int(x2 / scale)), min(H, int(y2 / scale))
+        )
+
+    print(
+        f"[timing] engine={engine}  waited_for_model={t_model:.1f}s  "
+        f"total={time.time() - t0:.1f}s  image={W}x{H}  items_found={len(raw)}"
+    )
+
+    return engine, raw
+
+
+def detect_worker(image, scope, key):
+
+    start = time.time()
+
+    try:
+        engine, raw = detect_raw(image, scope)
+        result_queue.put(("detected", key, engine, raw, time.time() - start))
+    except Exception as error:
+        result_queue.put(("error", str(error)))
+
+
+def preload_model():
+
+    try:
+        name = get_engine()
+        result_queue.put(("ready", name))
+    except Exception as error:
+        result_queue.put(("status", f"Detector not ready: {error}"))
+
+
+# ==========================================
+# FILTERING (instant, runs on the main thread)
+# ==========================================
+
+def box_area(b):
+    return max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+
+
+def boxes_overlap(a, b):
+    """True if two boxes are mostly the same object."""
+
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+
+    if inter == 0:
+        return False
+
+    union = box_area(a) + box_area(b) - inter
+    smaller = min(box_area(a), box_area(b))
+
+    if smaller == 0:
+        return True
+
+    return (inter / union > 0.45) or (inter / smaller > 0.75)
+
+
+def finalize_detections(raw, threshold, W, H):
+
+    candidates = [r for r in raw
+                  if r["conf"] >= threshold
+                  and (r["box"][2] - r["box"][0]) >= 10
+                  and (r["box"][3] - r["box"][1]) >= 10]
+
+    # Keep the highest-scoring label for each object
+    candidates.sort(key=lambda c: c["conf"], reverse=True)
+
+    kept = []
+
+    for c in candidates:
+        if all(not boxes_overlap(c["box"], k["box"]) for k in kept):
+            kept.append(c)
+
+    # Drop boxes covering almost the whole image when other items exist
+    if len(kept) > 1:
+        kept = [k for k in kept if box_area(k["box"]) < 0.85 * W * H]
+
+    return [{"food": k["food"], "conf": k["conf"],
+             "box": k["box"], "qty": DEFAULT_QTY} for k in kept[:30]]
+
+
+# ==========================================
+# RUNNING DETECTION (starts the worker thread)
+# ==========================================
+
+def set_current_image(image):
+
+    global uploaded_image, image_version, detections, current_raw
+    global display_base, display_scale
+
+    uploaded_image = image.copy()
+
+    # Small copy for drawing boxes and showing on screen (much faster than full size)
+    display_scale = min(1.0, 900 / max(image.shape[:2]))
+    display_base = cv2.resize(
+        image, None, fx=display_scale, fy=display_scale,
+        interpolation=cv2.INTER_AREA
+    ) if display_scale < 1 else image.copy()
+
+    image_version += 1
+    detections = []
+    current_raw = None
+    raw_cache.clear()
+
+
+def run_detection(force=False):
+
+    global busy
+
+    if uploaded_image is None:
+        messagebox.showwarning(
+            "No Image",
+            "Upload an image or start the webcam first."
+        )
+        return
+
+    if not (YOLOWORLD_AVAILABLE or OWL_AVAILABLE):
+        messagebox.showerror(
+            "Missing Packages",
+            "Detection needs this package:\n\n"
+            "pip install ultralytics"
+        )
+        return
+
+    if busy:
+        status_label.config(text="Still detecting, please wait...")
+        return
+
+    scope = scope_choice.get()
+    key = (image_version, scope)
+
+    if force:
+        raw_cache.pop(key, None)
+
+    if key in raw_cache:
+        engine, raw = raw_cache[key]
+        show_detections(engine, raw, None)
+        return
+
+    busy = True
+
+    progress.grid()
+    progress.start(12)
+
+    status_label.config(text="Detecting...")
+
+    threading.Thread(
+        target=detect_worker,
+        args=(uploaded_image.copy(), scope, key),
+        daemon=True
+    ).start()
+
+
+def show_detections(engine, raw, elapsed):
+
+    global detections, current_raw, current_engine
+    global slider_lock, last_engine_for_slider
+
+    current_raw = None            # blocks the slider callback while we set it
+
+    if engine != last_engine_for_slider:
+        slider_lock = True
+        sensitivity.set(DEFAULT_SENSITIVITY.get(engine, 0.12))
+        slider_lock = False
+        last_engine_for_slider = engine
+
+    current_raw = raw
+    current_engine = engine
+
+    H, W = uploaded_image.shape[:2]
+
+    detections = finalize_detections(raw, float(sensitivity.get()), W, H)
+
+    refresh_detections()
+
+    timing = f" in {elapsed:.1f} s" if elapsed is not None else ""
+
+    if detections:
+        status_label.config(
+            text=f"Detected {len(detections)} item(s){timing} using {engine}. "
+                 "Check the list and correct anything wrong. Missing some? "
+                 "Lower the sensitivity slider."
+        )
+    else:
+        status_label.config(
+            text=f"Nothing detected{timing} using {engine}. "
+                 "Lower the sensitivity slider or add items manually."
+        )
+
+
+def on_sensitivity_change(value=None):
+    """Slider moved: re-filter the cached results instantly (no re-detection)."""
+
+    global detections
+
+    if slider_lock or current_raw is None or uploaded_image is None:
+        return
+
+    H, W = uploaded_image.shape[:2]
+
+    detections = finalize_detections(
+        current_raw, float(sensitivity.get()), W, H
+    )
+
+    refresh_detections()
+
+    status_label.config(
+        text=f"{len(detections)} item(s) at sensitivity "
+             f"{float(sensitivity.get()):.2f}."
+    )
+
+
+def on_scope_change(event=None):
+
+    # Only re-run when the local detector's results are on screen
+    if uploaded_image is not None and current_raw is not None:
+        run_detection()
+
+
+def poll_queue():
+    """Receives messages from the background threads (main thread only)."""
+
+    global busy
+
+    try:
+        while True:
+
+            msg = result_queue.get_nowait()
+            kind = msg[0]
+
+            if kind == "status":
+                status_label.config(text=msg[1])
+
+            elif kind == "ready":
+                status_label.config(
+                    text=f"Detector ready ({msg[1]}). "
+                         "Upload an image to detect fruits and vegetables."
+                )
+
+            elif kind == "detected":
+
+                _, key, engine, raw, elapsed = msg
+
+                busy = False
+                progress.stop()
+                progress.grid_remove()
+
+                raw_cache[key] = (engine, raw)
+
+                if key[0] == image_version and key[1] == scope_choice.get():
+                    show_detections(engine, raw, elapsed)
+
+            elif kind == "cloud":
+
+                _, version, items, note, elapsed = msg
+
+                busy = False
+                progress.stop()
+                progress.grid_remove()
+
+                if version == image_version:
+                    show_cloud_items(items, note, elapsed)
+
+            elif kind == "error":
+
+                busy = False
+                progress.stop()
+                progress.grid_remove()
+
+                status_label.config(text="Detection failed.")
+                messagebox.showerror("Detection Error", msg[1])
+
+    except queue.Empty:
+        pass
+
+    root.after(100, poll_queue)
+
+
+# ==========================================
+# CLOUD ESTIMATE (fast): a vision AI reads the photo
+# ==========================================
+
+CLOUD_PROMPT = (
+    "Look at this photo of food. List every distinct food item you can see "
+    "(fruits, vegetables, cooked dishes, drinks, etc.).\n"
+    "For each item give:\n"
+    "- name: simple common English name, e.g. \"Apple\", \"Watermelon\", \"Dosa\"\n"
+    "- count: how many separate pieces are visible (a bunch of grapes or a bowl "
+    "of rice counts as 1)\n"
+    "- grams: your best estimate of the TOTAL weight in grams of all pieces of "
+    "that item shown\n"
+    "- kcal_per_100g: typical calories per 100 g for that food\n"
+    "Reply with ONLY a JSON object and no other text, in this format:\n"
+    "{\"items\": [{\"name\": \"Apple\", \"count\": 2, \"grams\": 300, "
+    "\"kcal_per_100g\": 52}], \"note\": \"one short sentence about anything "
+    "uncertain\"}\n"
+    "If there is no food in the photo, reply "
+    "{\"items\": [], \"note\": \"No food visible\"}."
+)
+
+
+def get_api_key():
+    """API key from the environment, or asked once per session (not saved)."""
+
+    global session_api_key
+
+    key = os.environ.get("ANTHROPIC_API_KEY") or session_api_key
+
+    if not key:
+        key = simpledialog.askstring(
+            "Anthropic API key",
+            "Enter your Anthropic API key.\n"
+            "It is kept in memory for this session only and never saved.\n\n"
+            "Tip: set the ANTHROPIC_API_KEY environment variable to skip this.",
+            show="*", parent=root
+        )
+
+        if key:
+            session_api_key = key.strip()
+            key = session_api_key
+
+    return key
+
+
+def parse_cloud_json(text):
+    """Turns the AI reply into detection rows. Returns (items, note)."""
+
+    match = re.search(r"\{.*\}", text, re.S)
+
+    if not match:
+        raise ValueError("The AI reply was not in the expected format.")
+
+    data = json.loads(match.group(0))
+
+    items = []
+
+    for it in data.get("items", []):
+
+        name = str(it.get("name", "")).strip()
+
+        try:
+            grams = float(it.get("grams", DEFAULT_QTY))
+            kcal100 = float(it.get("kcal_per_100g", 0))
+            count = max(1, int(it.get("count", 1)))
+        except (TypeError, ValueError):
+            continue
+
+        if not name or not (0 < grams <= 5000) or not (0 <= kcal100 <= 900):
+            continue
+
+        # Use the app's own database values when the food is in it
+        known = next((f for f in FOOD_DATA if f.lower() == name.lower()), None)
+
+        items.append({
+            "food": known or name.title(),
+            "conf": None,
+            "box": None,
+            "qty": round(grams, 1),
+            "kcal100": None if known else kcal100,
+            "count": count,
+        })
+
+    return items, str(data.get("note", "")).strip()
+
+
+def cloud_worker(image, api_key, version):
+    """Runs in a background thread."""
+
+    global session_api_key
+
+    start = time.time()
+
+    try:
+        H, W = image.shape[:2]
+        scale = min(1.0, CLOUD_MAX_SIDE / max(H, W))
+
+        small = cv2.resize(image, None, fx=scale, fy=scale,
+                           interpolation=cv2.INTER_AREA) if scale < 1 else image
+
+        ok, buf = cv2.imencode(".jpg", small,
+                               [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+
+        if not ok:
+            raise RuntimeError("Could not prepare the image.")
+
+        data = base64.standard_b64encode(buf.tobytes()).decode("utf-8")
+
+        client = anthropic.Anthropic(api_key=api_key)
+
+        response = client.messages.create(
+            model=CLOUD_MODEL,
+            max_tokens=1500,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image",
+                     "source": {"type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": data}},
+                    {"type": "text", "text": CLOUD_PROMPT},
+                ],
+            }],
+        )
+
+        text = "".join(b.text for b in response.content
+                       if getattr(b, "type", "") == "text")
+
+        items, note = parse_cloud_json(text)
+
+        result_queue.put(("cloud", version, items, note, time.time() - start))
+
+    except Exception as error:
+
+        message = str(error)
+
+        if "401" in message or "authentication" in message.lower():
+            session_api_key = None          # ask again next time
+            message += "\n\nCheck that your API key is correct."
+
+        result_queue.put(("error", "Cloud estimate failed:\n\n" + message))
+
+
+def grab_frame_if_running():
+    """If the webcam is live, freeze the current frame as the image."""
+
+    if camera_running and camera is not None:
+
+        success, frame = camera.read()
+
+        if not success:
+            messagebox.showerror("Camera Error", "Could not read a frame.")
+            return False
+
+        set_current_image(frame)
+        stop_camera()
+
+    return True
+
+
+def estimate_with_cloud():
+
+    global busy
+
+    if not grab_frame_if_running():
+        return
+
+    if uploaded_image is None:
+        messagebox.showwarning(
+            "No Image",
+            "Upload an image or start the webcam first."
+        )
+        return
+
+    if not ANTHROPIC_AVAILABLE:
+        messagebox.showerror(
+            "Missing Package",
+            "The fast estimate needs this package:\n\npip install anthropic"
+        )
+        return
+
+    if busy:
+        status_label.config(text="Still working, please wait...")
+        return
+
+    key = get_api_key()
+
+    if not key:
+        return
+
+    busy = True
+
+    progress.grid()
+    progress.start(12)
+
+    status_label.config(text="Asking the AI to estimate the calories...")
+
+    threading.Thread(
+        target=cloud_worker,
+        args=(uploaded_image.copy(), key, image_version),
+        daemon=True
+    ).start()
+
+
+def show_cloud_items(items, note, elapsed):
+
+    global detections, current_raw
+
+    current_raw = None            # local-detector results no longer apply
+
+    detections = items
+
+    refresh_detections()
+
+    total = sum(item_kcal(d) for d in detections)
+
+    if detections:
+        status_label.config(
+            text=f"Estimated {len(detections)} item(s) in {elapsed:.1f} s, "
+                 f"about {total:.0f} kcal in total. Weights are rough guesses: "
+                 f"edit the grams in the list. {note}"
+        )
+    else:
+        status_label.config(
+            text=f"No food found ({elapsed:.1f} s). {note} "
+                 "You can add items manually."
+        )
+
+
+# ==========================================
+# DETECTION LIST + ANNOTATED IMAGE
+# ==========================================
+
+def refresh_detections():
+
+    for row in detected_tree.get_children():
+        detected_tree.delete(row)
+
+    total_kcal = 0
+
+    for i, d in enumerate(detections):
+
+        kcal = item_kcal(d)
+        total_kcal += kcal
+
+        conf_text = (f"{d['conf'] * 100:.0f}%" if d.get("conf") is not None
+                     else "AI estimate")
+
+        name = d["food"]
+
+        if d.get("count", 1) > 1:
+            name += f" x{d['count']}"
+
+        detected_tree.insert(
+            "", tk.END, iid=str(i),
+            values=(i + 1, name, conf_text,
+                    f"{d['qty']:g}", f"{kcal:.1f}")
+        )
+
+    detected_total.config(text=f"Detected total: {total_kcal:.1f} kcal")
+
+    if uploaded_image is None:
+        return
+
+    img = display_base.copy()
+
+    big_side = max(img.shape[:2])
+    thickness = max(2, int(big_side / 300))
+    font_scale = max(0.6, big_side / 900)
+
+    for i, d in enumerate(detections):
+
+        if d.get("box") is None:          # cloud estimates have no boxes
+            continue
+
+        color = BOX_COLORS[i % len(BOX_COLORS)]
+        x1, y1, x2, y2 = [int(v * display_scale) for v in d["box"]]
+
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
+
+        label = f"{i + 1}. {d['food']}"
+        (tw, th), _ = cv2.getTextSize(label, FONT, font_scale, thickness)
+
+        y_text = max(th + 10, y1)
+
+        cv2.rectangle(img, (x1, y_text - th - 10),
+                      (x1 + tw + 10, y_text), color, -1)
+        cv2.putText(img, label, (x1 + 5, y_text - 6), FONT,
+                    font_scale, (255, 255, 255),
+                    max(1, thickness // 2), cv2.LINE_AA)
+
+    display_image(img)
+
+
+def selected_index():
+
+    sel = detected_tree.selection()
+
+    if not sel:
+        messagebox.showinfo("Select Item", "Select a row in the list first.")
+        return None
+
+    return int(sel[0])
+
+
+def on_tree_select(event=None):
+
+    sel = detected_tree.selection()
+
+    if not sel:
+        return
+
+    d = detections[int(sel[0])]
+
+    edit_food.set(d["food"])
+    edit_qty.delete(0, tk.END)
+    edit_qty.insert(0, f"{d['qty']:g}")
+
+
+def update_selected():
+
+    idx = selected_index()
+
+    if idx is None:
+        return
+
+    try:
+        qty = float(edit_qty.get())
+
+        if qty <= 0:
+            raise ValueError
+
+    except ValueError:
+        messagebox.showerror(
+            "Invalid Quantity",
+            "Enter a valid quantity greater than zero."
+        )
+        return
+
+    new_food = edit_food.get()
+
+    # Choosing a database food switches the row to the database calories;
+    # otherwise (e.g. an AI-estimated dish) the row keeps its own name/calories.
+    if new_food in FOOD_DATA:
+        detections[idx]["food"] = new_food
+        detections[idx].pop("kcal100", None)
+
+    detections[idx]["qty"] = qty
+
+    refresh_detections()
+    detected_tree.selection_set(str(idx))
+
+
+def remove_selected():
+
+    idx = selected_index()
+
+    if idx is None:
+        return
+
+    del detections[idx]
+
+    refresh_detections()
+
+
+def add_all_detected():
+
+    global detections
+
+    if not detections:
+        messagebox.showinfo("Nothing to Add", "No detected items to add.")
+        return
+
+    count = len(detections)
+    added_kcal = 0
+
+    for d in detections:
+        added_kcal += add_record(d["food"], d["qty"], d.get("kcal100"))
+
+    detections = []
+
+    refresh_detections()
+
+    status_label.config(
+        text=f"Added {count} item(s) to the tracker: {added_kcal:.1f} kcal."
+    )
+
+
+# ==========================================
+# TRACKER
+# ==========================================
+
+def add_record(food, quantity, kcal100=None):
+
+    global total_calories
+
+    if kcal100 is not None:
+        calories = round(kcal100 * quantity / 100, 2)
+    else:
+        calories = calculate_calories(food, quantity)
+
+    total_calories += calories
+
+    food_history.append({
+        "Date": datetime.now().strftime("%Y-%m-%d"),
+        "Time": datetime.now().strftime("%H:%M:%S"),
+        "Food": food,
+        "Quantity (g)": quantity,
+        "Calories (kcal)": calories
+    })
+
+    history_box.insert(
+        tk.END,
+        f"{food} | {quantity:g} g | {calories} kcal\n"
+    )
+    history_box.see(tk.END)
+
+    total_label.config(
+        text=f"TOTAL CALORIES: {total_calories:.2f} kcal"
+    )
+
+    return calories
+
+
+def update_food_details(event=None):
+
+    food = food_choice.get()
+
+    if food in FOOD_DATA:
+
+        category = FOOD_DATA[food]["category"]
+        calories = FOOD_DATA[food]["calories"]
+
+        food_info.config(
+            text=f"Category: {category}   |   "
+                 f"Calories: {calories} kcal / 100 g"
+        )
+
+
+def add_food():
+
+    food = food_choice.get()
+
+    if food not in FOOD_DATA:
+        messagebox.showwarning("Warning", "Select a food item.")
+        return
+
+    try:
+        quantity = float(quantity_entry.get())
+
+        if quantity <= 0:
+            raise ValueError
+
+    except ValueError:
+        messagebox.showerror(
+            "Invalid Quantity",
+            "Enter a valid quantity greater than zero."
+        )
+        return
+
+    calories = add_record(food, quantity)
+
+    status_label.config(
+        text=f"Added {food}: {quantity:g} g = {calories} kcal"
+    )
+
+
+# ==========================================
+# IMAGE UPLOAD
+# ==========================================
+
+def upload_image():
+
+    stop_camera()
+
+    file_path = filedialog.askopenfilename(
+        filetypes=[
+            ("Image Files", "*.jpg *.jpeg *.png *.bmp")
+        ]
+    )
+
+    if not file_path:
+        return
+
+    image = cv2.imread(file_path)
+
+    if image is None:
+        messagebox.showerror(
+            "Error",
+            "Unable to open the selected image."
+        )
+        return
+
+    set_current_image(image)
+
+    display_image(display_base)
+
+    if AUTO_DETECT_ON_UPLOAD:
+        run_detection()
+    else:
+        status_label.config(
+            text="Image loaded. Click 'AI Estimate (fast)' for a quick estimate, "
+                 "or 'Re-detect' to use the slower local detector."
+        )
+
+
+# ==========================================
+# WEBCAM
+# ==========================================
+
+def start_camera():
+
+    global camera, camera_running
+
+    if camera_running:
+        return
+
+    camera = cv2.VideoCapture(0)
+
+    if not camera.isOpened():
+
+        camera.release()
+        camera = None
+
+        messagebox.showerror(
+            "Camera Error",
+            "Unable to access webcam. Check camera permissions."
+        )
+        return
+
+    camera_running = True
+
+    status_label.config(
+        text="Live webcam running. Click 'Capture & Detect' when ready."
+    )
+
+    update_camera()
+
+
+def update_camera():
+
+    if not camera_running or camera is None:
+        return
+
+    success, frame = camera.read()
+
+    if success:
+        display_image(frame)
+
+    root.after(30, update_camera)
+
+
+def stop_camera():
+
+    global camera, camera_running
+
+    was_running = camera_running
+
+    camera_running = False
+
+    if camera is not None:
+        camera.release()
+        camera = None
+
+    if was_running:
+        status_label.config(text="Webcam stopped.")
+
+
+def capture_and_detect():
+
+    if camera_running and camera is not None:
+
+        success, frame = camera.read()
+
+        if not success:
+            messagebox.showerror("Camera Error", "Could not read a frame.")
+            return
+
+        set_current_image(frame)
+
+        stop_camera()
+
+    run_detection()
+
+
+# ==========================================
+# SAVE REPORT
+# ==========================================
+
+def save_report():
+
+    if not food_history:
+
+        messagebox.showwarning(
+            "No Records",
+            "Add food items before saving the report."
+        )
+        return
+
+    df = pd.DataFrame(food_history)
+
+    file_exists = os.path.exists(REPORT_FILE)
+
+    df.to_csv(
+        REPORT_FILE,
+        mode="a" if file_exists else "w",
+        header=not file_exists,
+        index=False
+    )
+
+    food_history.clear()
+
+    history_box.delete("1.0", tk.END)
+
+    messagebox.showinfo(
+        "Report Saved",
+        f"Food tracking report saved as:\n{os.path.abspath(REPORT_FILE)}"
+    )
+
+
+# ==========================================
+# RESET TRACKER
+# ==========================================
+
+def reset_tracker():
+
+    global total_calories
+
+    total_calories = 0
+    food_history.clear()
+
+    history_box.delete("1.0", tk.END)
+
+    total_label.config(text="TOTAL CALORIES: 0 kcal")
+
+    status_label.config(
+        text="Current food tracking session has been reset."
+    )
+
+
+def close_application():
+
+    stop_camera()
+
+    root.destroy()
+
+
+# ==========================================
+# MAIN WINDOW
+# ==========================================
+
+root = tk.Tk()
+
+root.title("AI Food Recognition and Calorie Tracking")
+
+root.geometry("1180x750")
+root.minsize(1100, 710)
+
+root.configure(bg=BG)
+
+root.protocol("WM_DELETE_WINDOW", close_application)
+
+tk.Label(
+    root,
+    text="FOOD RECOGNITION & CALORIE TRACKING",
+    font=("Arial", 21, "bold"),
+    bg=BG,
+    fg="#16324f"
+).grid(row=0, column=0, columnspan=2, pady=10)
+
+
+# ==========================================
+# LEFT COLUMN: IMAGE, CAMERA, DETECTED ITEMS
+# ==========================================
+
+left = tk.Frame(root, bg=BG)
+left.grid(row=1, column=0, padx=15, pady=0, sticky="n")
+
+image_frame = tk.Frame(left, width=IMAGE_W, height=IMAGE_H, bg="white")
+image_frame.pack_propagate(False)
+image_frame.pack()
+
+image_display = tk.Label(
+    image_frame,
+    text="No image loaded\n\nUpload an image or start the webcam",
+    bg="white",
+    fg="#64748b",
+    font=("Arial", 12)
+)
+
+image_display.pack(expand=True, fill="both")
+
+camera_frame = tk.Frame(left, bg=BG)
+camera_frame.pack(pady=8)
+
+tk.Button(
+    camera_frame, text="Upload Food Image", command=upload_image,
+    width=15, bg="#2563eb", fg="white"
+).grid(row=0, column=0, padx=4)
+
+tk.Button(
+    camera_frame, text="Start Webcam", command=start_camera,
+    width=11, bg="#16a34a", fg="white"
+).grid(row=0, column=1, padx=4)
+
+tk.Button(
+    camera_frame, text="Stop Webcam", command=stop_camera,
+    width=11, bg="#dc2626", fg="white"
+).grid(row=0, column=2, padx=4)
+
+tk.Button(
+    camera_frame, text="Capture & Detect", command=capture_and_detect,
+    width=14, bg="#ea580c", fg="white"
+).grid(row=0, column=3, padx=4)
+
+tk.Button(
+    camera_frame, text="AI Estimate (fast)", command=estimate_with_cloud,
+    width=16, bg="#7c3aed", fg="white", font=("Arial", 9, "bold")
+).grid(row=0, column=4, padx=4)
+
+# ---- Detected items ----
+
+detect_frame = tk.LabelFrame(
+    left,
+    text="Detected Fruits & Vegetables",
+    font=("Arial", 11, "bold"),
+    bg=BG,
+    padx=8,
+    pady=6
+)
+
+detect_frame.pack(fill="x")
+
+options_row = tk.Frame(detect_frame, bg=BG)
+options_row.pack(fill="x", pady=(0, 6))
+
+tk.Label(options_row, text="Look for:", bg=BG).pack(side="left")
+
+scope_choice = ttk.Combobox(
+    options_row, values=SCOPES, state="readonly", width=19
+)
+scope_choice.pack(side="left", padx=(4, 12))
+scope_choice.set(SCOPES[0])
+scope_choice.bind("<<ComboboxSelected>>", on_scope_change)
+
+tk.Label(options_row, text="Sensitivity (lower finds more):",
+         bg=BG).pack(side="left")
+
+sensitivity = tk.Scale(
+    options_row, from_=0.03, to=0.40, resolution=0.01,
+    orient="horizontal", length=130, bg=BG, highlightthickness=0,
+    command=on_sensitivity_change
+)
+sensitivity.pack(side="left", padx=4)
+sensitivity.set(0.15)
+
+tk.Button(
+    options_row, text="Re-detect", command=lambda: run_detection(force=True),
+    bg="#ea580c", fg="white"
+).pack(side="left", padx=4)
+
+columns = ("no", "food", "conf", "qty", "kcal")
+
+detected_tree = ttk.Treeview(
+    detect_frame, columns=columns, show="headings",
+    height=4, selectmode="browse"
+)
+
+for col, text, width in [
+    ("no", "#", 35), ("food", "Food", 160), ("conf", "Confidence", 100),
+    ("qty", "Quantity (g)", 110), ("kcal", "Calories (kcal)", 120)
+]:
+    detected_tree.heading(col, text=text)
+    detected_tree.column(col, width=width, anchor="center")
+
+detected_tree.pack(fill="x")
+detected_tree.bind("<<TreeviewSelect>>", on_tree_select)
+
+edit_row = tk.Frame(detect_frame, bg=BG)
+edit_row.pack(fill="x", pady=(6, 0))
+
+edit_food = ttk.Combobox(
+    edit_row, values=list(FOOD_DATA.keys()), state="readonly", width=13
+)
+edit_food.pack(side="left", padx=2)
+
+edit_qty = tk.Entry(edit_row, width=7)
+edit_qty.pack(side="left", padx=2)
+edit_qty.insert(0, "100")
+
+tk.Label(edit_row, text="g", bg=BG).pack(side="left")
+
+tk.Button(
+    edit_row, text="Update", command=update_selected,
+    width=8, bg="#0891b2", fg="white"
+).pack(side="left", padx=4)
+
+tk.Button(
+    edit_row, text="Remove", command=remove_selected,
+    width=8, bg="#475569", fg="white"
+).pack(side="left", padx=2)
+
+tk.Button(
+    edit_row, text="ADD ALL TO TRACKER", command=add_all_detected,
+    bg="#7c3aed", fg="white", font=("Arial", 10, "bold")
+).pack(side="right", padx=2)
+
+detected_total = tk.Label(
+    detect_frame, text="Detected total: 0 kcal",
+    bg=BG, fg="#15803d", font=("Arial", 10, "bold")
+)
+
+detected_total.pack(anchor="w", pady=(4, 0))
+
+
+# ==========================================
+# RIGHT COLUMN: MANUAL ADD, TOTAL, HISTORY
+# ==========================================
+
+right = tk.Frame(root, bg=BG)
+right.grid(row=1, column=1, padx=15, pady=0, sticky="n")
+
+selection_frame = tk.LabelFrame(
+    right,
+    text="Add Manually (items not detected)",
+    font=("Arial", 11, "bold"),
+    bg=BG,
+    padx=12,
+    pady=8
+)
+
+selection_frame.pack(fill="x")
+
+tk.Label(
+    selection_frame, text="Select Food:", bg=BG, font=("Arial", 11)
+).grid(row=0, column=0, padx=8, pady=6, sticky="w")
+
+food_choice = ttk.Combobox(
+    selection_frame, values=list(FOOD_DATA.keys()),
+    state="readonly", width=20
+)
+
+food_choice.grid(row=0, column=1, padx=8)
+food_choice.set("Apple")
+food_choice.bind("<<ComboboxSelected>>", update_food_details)
+
+tk.Label(
+    selection_frame, text="Quantity (grams):", bg=BG, font=("Arial", 11)
+).grid(row=1, column=0, padx=8, pady=6, sticky="w")
+
+quantity_entry = tk.Entry(selection_frame, width=23)
+quantity_entry.grid(row=1, column=1, padx=8)
+quantity_entry.insert(0, "100")
+
+food_info = tk.Label(
+    selection_frame, text="", bg=BG, fg="#2563eb",
+    font=("Arial", 10, "bold")
+)
+
+food_info.grid(row=2, column=0, columnspan=2, pady=6)
+
+update_food_details()
+
+tk.Button(
+    right, text="ADD FOOD TO TRACKER", command=add_food,
+    width=28, bg="#7c3aed", fg="white", font=("Arial", 11, "bold")
+).pack(pady=10)
+
+total_label = tk.Label(
+    right, text="TOTAL CALORIES: 0 kcal",
+    font=("Arial", 17, "bold"), bg=BG, fg="#15803d"
+)
+
+total_label.pack(pady=4)
+
+tk.Label(
+    right, text="FOOD TRACKING HISTORY",
+    font=("Arial", 12, "bold"), bg=BG
+).pack(pady=(10, 4))
+
+history_box = tk.Text(right, width=46, height=10, font=("Arial", 10))
+history_box.pack()
+
+action_frame = tk.Frame(right, bg=BG)
+action_frame.pack(pady=10)
+
+tk.Button(
+    action_frame, text="Save Report", command=save_report,
+    width=16, bg="#0891b2", fg="white"
+).grid(row=0, column=0, padx=8)
+
+tk.Button(
+    action_frame, text="Reset Tracker", command=reset_tracker,
+    width=16, bg="#475569", fg="white"
+).grid(row=0, column=1, padx=8)
+
+
+# ==========================================
+# STATUS BAR + PROGRESS
+# ==========================================
+
+status_label = tk.Label(
+    root,
+    text="Starting...",
+    font=("Arial", 10),
+    bg=BG,
+    fg="#334155",
+    wraplength=1100
+)
+
+status_label.grid(row=2, column=0, columnspan=2, pady=(8, 2))
+
+progress = ttk.Progressbar(root, mode="indeterminate", length=320)
+progress.grid(row=3, column=0, columnspan=2, pady=(0, 8))
+progress.grid_remove()
+
+
+# ==========================================
+# START: poll background threads + preload detector
+# ==========================================
+
+root.after(100, poll_queue)
+
+if PRELOAD_LOCAL_MODEL and (YOLOWORLD_AVAILABLE or OWL_AVAILABLE):
+    status_label.config(text="Loading detection model in the background...")
+    threading.Thread(target=preload_model, daemon=True).start()
+else:
+    status_label.config(
+        text="Ready. Upload an image, then click 'AI Estimate (fast)'. "
+             "('Re-detect' uses the slower local detector.)"
+    )
+
+root.mainloop()
