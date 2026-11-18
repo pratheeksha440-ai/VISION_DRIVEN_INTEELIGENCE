@@ -1,0 +1,26 @@
+# ========================================================
+# Multi-Domain AI Suite - Production Requirements
+# Compatible with Linux, Windows, macOS, Docker & Cloud
+# (Render, Railway, Fly.io, Heroku, AWS, GCP, Azure)
+# ========================================================
+
+# Web Framework & Server
+starlette>=0.28.0
+uvicorn[standard]>=0.20.0
+python-multipart>=0.0.6
+
+# Computer Vision & Image Processing
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
+pillow>=10.0.0
+
+# Data Management & CSV Reports
+pandas>=2.0.0
+
+# Optional: Uncomment if running standalone offline ML models locally
+# ultralytics>=8.0.0
+# mediapipe>=0.10.14
+# transformers>=4.30.0
+# torch>=2.0.0
+# pyttsx3>=2.90
+
