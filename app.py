@@ -1209,15 +1209,6 @@ tr:hover { background: rgba(255, 255, 255, 0.02); }
             Category: Fruit &bull; Base Nutrition: 52 kcal / 100g
           </div>
 
-          <!-- Produce Ripeness & Rotten Detection Badge -->
-          <div id="foodRipenessBox" style="background:#131d31; border:1px solid #334155; padding:10px 14px; border-radius:6px; margin-bottom:14px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-            <div>
-              <div style="font-size:11px; color:var(--text-muted); font-weight:700;">MATURITY & FRESHNESS:</div>
-              <div id="foodFreshnessText" style="font-size:13px; font-weight:700; color:#34d399;">✅ Fresh & Ripe (Optimal Quality)</div>
-            </div>
-            <span id="foodRipenessBadge" class="badge badge-ripe">Ripe (96% Maturity)</span>
-          </div>
-
           <div style="margin-bottom:14px;">
             <div style="display:flex; justify-content:space-between; font-size:13px; color:var(--text-muted); margin-bottom:6px;">
               <span>Adjust Portion Weight:</span>
@@ -2607,23 +2598,6 @@ function renderDetectedFood(res) {
   document.getElementById('detectedFoodTitle').textContent = `${icon} ${res.food}`;
   document.getElementById('detectedFoodCategory').textContent = `Category: ${res.category || 'Food'} • Base Nutrition: ${currentKcalPer100} kcal / 100g`;
   document.getElementById('foodConfidenceBadge').textContent = `${res.confidence}% Confident (${res.method})`;
-
-  // Display Rotten vs Ripe Maturity State
-  const freshnessText = res.freshness_label || '✅ Fresh & Ripe (Optimal Quality)';
-  const ripStatus = res.ripeness_status || 'Fresh & Ripe';
-  const ripScore = res.ripeness_score !== undefined ? res.ripeness_score : 95;
-  const ripBadgeClass = res.ripeness_badge || (ripStatus.includes('Rotten') ? 'badge-rotten' : ripStatus.includes('Unripe') ? 'badge-unripe' : 'badge-ripe');
-
-  const textEl = document.getElementById('foodFreshnessText');
-  if (textEl) {
-    textEl.textContent = freshnessText;
-    textEl.style.color = ripBadgeClass === 'badge-rotten' ? '#f87171' : ripBadgeClass === 'badge-unripe' ? '#fbbf24' : '#34d399';
-  }
-  const badgeEl = document.getElementById('foodRipenessBadge');
-  if (badgeEl) {
-    badgeEl.className = 'badge ' + ripBadgeClass;
-    badgeEl.textContent = `${ripStatus} (${ripScore}% Maturity)`;
-  }
 
   document.getElementById('foodQtySlider').value = res.estimated_qty;
   updateFoodFromSlider();
