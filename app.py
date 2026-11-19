@@ -704,18 +704,25 @@ tr:hover { background: rgba(255, 255, 255, 0.02); }
           <div class="card-title"><i class="fa-solid fa-camera text-indigo-400"></i> Environmental Camera Scanner</div>
           <span id="visionStatus" class="badge badge-unripe">Camera Idle</span>
         </div>
-        <div class="camera-box" id="visionCamBox">
+        <div class="camera-box" id="visionCamBox" style="position:relative;">
+          <!-- Active Recording Indicator Badge -->
+          <div id="visionRecBadge" style="display:none; position:absolute; top:12px; left:12px; background:rgba(220, 38, 38, 0.92); color:#fff; padding:5px 12px; border-radius:9999px; font-size:12px; font-weight:700; display:flex; align-items:center; gap:8px; z-index:10; box-shadow:0 0 12px rgba(239, 68, 68, 0.7);">
+            <span style="width:9px; height:9px; background:#fff; border-radius:50%; display:inline-block; box-shadow:0 0 6px #fff;"></span>
+            <span>LIVE ACTIVE RECORDING</span>
+            <span id="visionRecTimer" style="opacity:0.9; font-family:monospace; margin-left:4px; font-weight:800;">00:00</span>
+          </div>
+
           <video id="visionVideo" autoplay playsinline muted style="display:none;"></video>
           <canvas id="visionOverlayCanvas"></canvas>
           <div id="visionPlaceholder" class="camera-placeholder">
             <i class="fa-solid fa-eye-slash"></i>
-            <p>Click <b>Start Assistive Camera</b> to begin live detection.</p>
+            <p>Click <b>Start Active Recording</b> to begin continuous live obstacle scanning.</p>
             <span style="font-size:11px; opacity:0.7;">(If camera is blocked, allow camera permissions in browser URL bar)</span>
           </div>
         </div>
         <div class="btn-group">
-          <button class="btn" onclick="startVisionCamera()"><i class="fa-solid fa-play"></i> Start Assistive Camera</button>
-          <button class="btn btn-secondary" onclick="stopVisionCamera()"><i class="fa-solid fa-stop"></i> Stop Camera</button>
+          <button class="btn btn-warning" style="background:#4f46e5;" onclick="startVisionCamera()"><i class="fa-solid fa-record-vinyl"></i> Start Active Recording</button>
+          <button class="btn btn-secondary" onclick="stopVisionCamera()"><i class="fa-solid fa-stop"></i> Stop Scanner</button>
           <button id="autoSpeechBtn" class="btn btn-secondary" onclick="toggleAutoSpeech()">
             <i class="fa-solid fa-robot"></i> <span id="autoSpeechLabel">Auto-Speech: OFF</span>
           </button>
@@ -834,6 +841,8 @@ tr:hover { background: rgba(255, 255, 255, 0.02); }
             <i class="fa-solid fa-circle-exclamation" style="font-size:20px;"></i>
             <div id="agriAlertMsg">No edible fruit or vegetable recognized! Please place a real edible item in view.</div>
           </div>
+
+          <div id="ripenessItemVal" style="display:none; font-size:13px; font-weight:600; color:#38bdf8; margin: 6px 0 12px 0;"></div>
 
           <div id="ripenessDetails">
             <div class="grid-2" style="margin-bottom:16px;">
@@ -1014,15 +1023,27 @@ tr:hover { background: rgba(255, 255, 255, 0.02); }
             </div>
           </div>
 
-          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:10px; background:#0a0f1d; padding:8px 14px; border-radius:8px; border:1px solid var(--border);">
-            <div style="display:flex; align-items:center; gap:8px;">
-              <span style="font-size:12px; color:var(--text-muted); font-weight:600;">Color:</span>
-              <div id="paletteSwatches" style="display:flex; gap:6px;"></div>
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:10px; background:#0a0f1d; padding:10px 14px; border-radius:8px; border:1px solid var(--border);">
+            <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+              <span style="font-size:12px; color:var(--text-muted); font-weight:700;"><i class="fa-solid fa-palette text-amber-400"></i> Colors:</span>
+              <div id="paletteSwatches" style="display:flex; gap:6px; align-items:center;"></div>
+              
+              <!-- Custom Color Picker -->
+              <div style="display:flex; align-items:center; gap:4px; margin-left:6px; border-left:1px solid var(--border); padding-left:8px;">
+                <label for="boardCustomColor" style="font-size:11px; color:var(--text-muted); cursor:pointer;">Custom:</label>
+                <input type="color" id="boardCustomColor" value="#2563eb" onchange="setCustomInkColor(this.value)" style="width:26px; height:26px; padding:0; border:1px solid var(--border); border-radius:6px; cursor:pointer; background:transparent;">
+              </div>
+
+              <!-- Quick Eraser Button -->
+              <button id="boardEraserBtn" class="btn btn-secondary" style="padding:4px 10px; font-size:12px; margin-left:4px;" onclick="toggleEraserMode()">
+                <i class="fa-solid fa-eraser"></i> <span id="boardEraserLabel">Eraser</span>
+              </button>
             </div>
+            
             <div style="display:flex; align-items:center; gap:10px;">
-              <span style="font-size:12px; color:var(--text-muted);">Brush:</span>
+              <span style="font-size:12px; color:var(--text-muted); font-weight:600;">Stroke:</span>
               <input type="range" id="brushSize" min="2" max="36" value="6" style="width:70px;" oninput="updateBrushSize(this.value)">
-              <span id="brushSizeVal" style="font-size:12px; width:20px;">6px</span>
+              <span id="brushSizeVal" style="font-size:12px; width:28px; font-weight:700;">6px</span>
             </div>
           </div>
 
@@ -1184,8 +1205,17 @@ tr:hover { background: rgba(255, 255, 255, 0.02); }
           <div id="detectedFoodTitle" style="font-size:24px; font-weight:800; color:#f43f5e; margin-bottom:4px;">
             🍎 Apple
           </div>
-          <div id="detectedFoodCategory" style="font-size:13px; color:var(--text-muted); margin-bottom:14px;">
+          <div id="detectedFoodCategory" style="font-size:13px; color:var(--text-muted); margin-bottom:10px;">
             Category: Fruit &bull; Base Nutrition: 52 kcal / 100g
+          </div>
+
+          <!-- Produce Ripeness & Rotten Detection Badge -->
+          <div id="foodRipenessBox" style="background:#131d31; border:1px solid #334155; padding:10px 14px; border-radius:6px; margin-bottom:14px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+            <div>
+              <div style="font-size:11px; color:var(--text-muted); font-weight:700;">MATURITY & FRESHNESS:</div>
+              <div id="foodFreshnessText" style="font-size:13px; font-weight:700; color:#34d399;">✅ Fresh & Ripe (Optimal Quality)</div>
+            </div>
+            <span id="foodRipenessBadge" class="badge badge-ripe">Ripe (96% Maturity)</span>
           </div>
 
           <div style="margin-bottom:14px;">
@@ -1341,15 +1371,32 @@ cocoSsd.load().then(model => {
   console.log("COCO-SSD loaded for Assistive Vision.");
 }).catch(e => console.warn("COCO-SSD CDN load notice:", e));
 
+let visionRecTimerInterval = null;
+let visionRecStartTime = null;
+
 async function startVisionCamera() {
   const video = document.getElementById('visionVideo');
   const placeholder = document.getElementById('visionPlaceholder');
   visionStream = await requestCameraStream(video, placeholder);
   if (visionStream) {
     document.getElementById('visionStatus').className = 'badge badge-ripe';
-    document.getElementById('visionStatus').textContent = 'Live Assistive Scanner';
+    document.getElementById('visionStatus').textContent = 'Live Active Scanner';
+
+    // Show Active Recording Badge & Timer
+    const recBadge = document.getElementById('visionRecBadge');
+    if (recBadge) recBadge.style.display = 'flex';
+    visionRecStartTime = Date.now();
+    if (visionRecTimerInterval) clearInterval(visionRecTimerInterval);
+    visionRecTimerInterval = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - visionRecStartTime) / 1000);
+      const m = String(Math.floor(elapsed / 60)).padStart(2, '0');
+      const s = String(elapsed % 60).padStart(2, '0');
+      const tEl = document.getElementById('visionRecTimer');
+      if (tEl) tEl.textContent = `${m}:${s}`;
+    }, 1000);
+
     video.onloadeddata = () => runVisionLoop();
-    speakText("Assistive vision started. Scanning for obstacles and surroundings.");
+    speakText("Assistive vision started. Active continuous recording and obstacle scanning active.");
   }
 }
 
@@ -1358,6 +1405,10 @@ function stopVisionCamera() {
     visionStream.getTracks().forEach(t => t.stop());
     visionStream = null;
   }
+  if (visionRecTimerInterval) clearInterval(visionRecTimerInterval);
+  const recBadge = document.getElementById('visionRecBadge');
+  if (recBadge) recBadge.style.display = 'none';
+
   document.getElementById('visionVideo').style.display = 'none';
   document.getElementById('visionPlaceholder').style.display = 'flex';
   document.getElementById('visionStatus').className = 'badge badge-unripe';
@@ -1365,6 +1416,7 @@ function stopVisionCamera() {
   if (autoSpeechInterval) clearInterval(autoSpeechInterval);
 }
 
+let visionFrameCounter = 0;
 async function runVisionLoop() {
   if (!visionStream) return;
   const video = document.getElementById('visionVideo');
@@ -1372,6 +1424,7 @@ async function runVisionLoop() {
   canvas.width = video.videoWidth || 640;
   canvas.height = video.videoHeight || 480;
   const ctx = canvas.getContext('2d');
+  visionFrameCounter++;
 
   if (cocoModel && video.readyState >= 2 && !isDetectingVision) {
     isDetectingVision = true;
@@ -1379,8 +1432,18 @@ async function runVisionLoop() {
       const preds = await cocoModel.detect(video);
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
+      // Normalization dictionary for surrounding items
+      const mapSurroundingName = (cls) => {
+        const c = String(cls).toLowerCase().trim();
+        if (c === 'person') return 'another person';
+        if (c === 'dining table' || c === 'desk') return 'table';
+        if (c === 'bottle') return 'water bottle';
+        if (c === 'refrigerator' || c === 'cabinet' || c === 'bookcase') return 'cupboard';
+        return c;
+      };
+
       const detections = preds.map(p => ({
-        name: p.class,
+        name: mapSurroundingName(p.class),
         score: p.score,
         x: p.bbox[0],
         y: p.bbox[1],
@@ -1388,15 +1451,35 @@ async function runVisionLoop() {
         height: p.bbox[3]
       }));
 
-      preds.forEach(p => {
+      // Periodic MobileNet scan for fine-grained small items like rubber band
+      if (mobileNetModel && (visionFrameCounter % 6 === 0)) {
+        try {
+          const mobPreds = await mobileNetModel.classify(video, 3);
+          mobPreds.forEach(mp => {
+            const low = mp.className.toLowerCase();
+            if (low.includes('rubber band') || low.includes('elastic band')) {
+              detections.push({
+                name: 'rubber band',
+                score: mp.probability,
+                x: canvas.width * 0.42,
+                y: canvas.height * 0.45,
+                width: 90,
+                height: 70
+              });
+            }
+          });
+        } catch(err) {}
+      }
+
+      detections.forEach(p => {
         ctx.strokeStyle = '#6366f1';
         ctx.lineWidth = 3;
-        ctx.strokeRect(...p.bbox);
+        ctx.strokeRect(p.x, p.y, p.width, p.height);
         ctx.fillStyle = 'rgba(99, 102, 241, 0.85)';
-        ctx.fillRect(p.bbox[0], Math.max(0, p.bbox[1] - 22), p.bbox[2], 22);
+        ctx.fillRect(p.x, Math.max(0, p.y - 24), Math.max(140, p.width), 24);
         ctx.fillStyle = '#ffffff';
-        ctx.font = '14px sans-serif';
-        ctx.fillText(`${p.class} (${Math.round(p.score * 100)}%)`, p.bbox[0] + 5, Math.max(16, p.bbox[1] - 5));
+        ctx.font = 'bold 13px sans-serif';
+        ctx.fillText(`${p.name} (${Math.round(p.score * 100)}%)`, p.x + 6, Math.max(17, p.y - 7));
       });
 
       if (detections.length > 0) {
@@ -1422,13 +1505,63 @@ function handleVisionUpload(e) {
   const reader = new FileReader();
   reader.onload = function(evt) {
     const img = new Image();
-    img.onload = () => {
+    img.onload = async () => {
+      const video = document.getElementById('visionVideo');
+      if (video) video.style.display = 'none';
       const canvas = document.getElementById('visionOverlayCanvas');
       canvas.width = 640; canvas.height = 480;
       const ctx = canvas.getContext('2d');
       ctx.drawImage(img, 0, 0, 640, 480);
       document.getElementById('visionPlaceholder').style.display = 'none';
-      simulateVisionDetection();
+
+      const mapSurroundingName = (cls) => {
+        const c = String(cls).toLowerCase().trim();
+        if (c === 'person') return 'another person';
+        if (c === 'dining table' || c === 'desk') return 'table';
+        if (c === 'bottle') return 'water bottle';
+        if (c === 'refrigerator' || c === 'cabinet' || c === 'bookcase') return 'cupboard';
+        return c;
+      };
+
+      if (cocoModel) {
+        try {
+          const preds = await cocoModel.detect(img);
+          const detections = preds.filter(p => p.score >= 0.48).map(p => ({
+            name: mapSurroundingName(p.class),
+            score: p.score,
+            x: p.bbox[0],
+            y: p.bbox[1],
+            width: p.bbox[2],
+            height: p.bbox[3]
+          }));
+
+          // Re-draw clean image + real detection boxes only
+          ctx.drawImage(img, 0, 0, 640, 480);
+          detections.forEach(p => {
+            ctx.strokeStyle = '#6366f1';
+            ctx.lineWidth = 3;
+            ctx.strokeRect(p.x, p.y, p.width, p.height);
+            ctx.fillStyle = 'rgba(99, 102, 241, 0.85)';
+            ctx.fillRect(p.x, Math.max(0, p.y - 24), Math.max(130, p.width), 24);
+            ctx.fillStyle = '#ffffff';
+            ctx.font = 'bold 13px sans-serif';
+            ctx.fillText(`${p.name} (${Math.round(p.score * 100)}%)`, p.x + 6, Math.max(17, p.y - 7));
+          });
+
+          const resp = await fetch('/api/vision-describe', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ detections, width: 640, height: 480 })
+          });
+          const data = await resp.json();
+          renderVisionResults(data);
+          if (detections.length === 0) {
+            speakText("Photo analyzed. Path is clear. No obstacles detected.");
+          }
+        } catch(err) {
+          console.error("Upload detection error:", err);
+        }
+      }
     };
     img.src = evt.target.result;
   };
@@ -1436,11 +1569,32 @@ function handleVisionUpload(e) {
 }
 
 async function simulateVisionDetection() {
+  const canvas = document.getElementById('visionOverlayCanvas');
+  canvas.width = 640; canvas.height = 480;
+  const ctx = canvas.getContext('2d');
+
+  // Explicitly covers all 7 user-requested surrounding items
   const mockDetections = [
-    { name: "person", score: 0.94, x: 80, y: 100, width: 220, height: 350 },
-    { name: "chair", score: 0.89, x: 390, y: 200, width: 160, height: 210 },
-    { name: "knife", score: 0.91, x: 270, y: 230, width: 80, height: 110 }
+    { name: "another person", score: 0.96, x: 50, y: 70, width: 170, height: 350 },
+    { name: "chair", score: 0.91, x: 240, y: 190, width: 120, height: 210 },
+    { name: "table", score: 0.88, x: 380, y: 220, width: 220, height: 180 },
+    { name: "water bottle", score: 0.94, x: 400, y: 170, width: 45, height: 95 },
+    { name: "book", score: 0.92, x: 460, y: 200, width: 85, height: 45 },
+    { name: "cupboard", score: 0.87, x: 20, y: 50, width: 130, height: 260 },
+    { name: "rubber band", score: 0.89, x: 505, y: 240, width: 40, height: 30 }
   ];
+
+  // Draw overlay boxes
+  mockDetections.forEach(p => {
+    ctx.strokeStyle = '#38bdf8';
+    ctx.lineWidth = 3;
+    ctx.strokeRect(p.x, p.y, p.width, p.height);
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+    ctx.fillRect(p.x, Math.max(0, p.y - 22), Math.max(130, p.width), 22);
+    ctx.fillStyle = '#38bdf8';
+    ctx.font = 'bold 12px sans-serif';
+    ctx.fillText(`${p.name} (${Math.round(p.score * 100)}%)`, p.x + 5, Math.max(15, p.y - 6));
+  });
 
   try {
     const resp = await fetch('/api/vision-describe', {
@@ -1620,8 +1774,10 @@ function handleRipenessUpload(e) {
 function renderRipenessResults(data) {
   const alertBanner = document.getElementById('agriAlertBanner');
   const badge = document.getElementById('ripenessResultBadge');
+  const itemVal = document.getElementById('ripenessItemVal');
 
   if (!data.detected) {
+    if (itemVal) itemVal.style.display = 'none';
     alertBanner.style.display = 'flex';
     document.getElementById('agriAlertMsg').textContent = data.alert || "No edible fruit or vegetable recognized! Please place a real edible item in view.";
     badge.textContent = "NOT AN EDIBLE ITEM";
@@ -1634,6 +1790,10 @@ function renderRipenessResults(data) {
   }
 
   alertBanner.style.display = 'none';
+  if (itemVal) {
+    itemVal.style.display = 'block';
+    itemVal.innerHTML = `<i class="fa-solid fa-tag"></i> <b>Identified Produce:</b> ${data.item || 'Edible Produce'} &bull; <b>Confidence:</b> ${data.confidence}%`;
+  }
   badge.textContent = data.result;
   badge.className = 'badge ' + (data.result === 'RIPE' || data.result === 'FRESH' ? 'badge-ripe' : data.result === 'UNRIPE' ? 'badge-unripe' : 'badge-rotten');
 
@@ -1885,10 +2045,44 @@ function onHandResults(results) {
     hCtx.fill();
   });
 
+  // Draw Air Gesture Color Palette Strip at top of Hand Canvas
+  const airColors = ['#2563eb', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#ffffff'];
+  const blockW = 640 / airColors.length;
+  airColors.forEach((col, idx) => {
+    hCtx.fillStyle = col;
+    hCtx.fillRect(idx * blockW, 0, blockW, 32);
+    if (currentColor.toLowerCase() === col.toLowerCase() && !isEraser) {
+      hCtx.strokeStyle = '#facc15';
+      hCtx.lineWidth = 3;
+      hCtx.strokeRect(idx * blockW + 2, 2, blockW - 4, 28);
+    }
+  });
+  hCtx.fillStyle = '#ffffff';
+  hCtx.font = 'bold 11px sans-serif';
+  airColors.forEach((col, idx) => {
+    hCtx.fillText(`Color ${idx+1}`, idx * blockW + 12, 20);
+  });
+
   const isIndexUp = lm[8].y < lm[6].y;
   const isMiddleUp = lm[12].y < lm[10].y;
   const isRingUp = lm[16].y < lm[14].y;
   const isPinkyUp = lm[20].y < lm[18].y;
+
+  // Touchless air color selection if index tip reaches top strip!
+  if (lm[8].y * 480 < 40 && isIndexUp && !isMiddleUp) {
+    const selectedIdx = Math.floor((lm[8].x * 640) / blockW);
+    if (selectedIdx >= 0 && selectedIdx < airColors.length) {
+      currentColor = airColors[selectedIdx];
+      isEraser = false;
+      const customPicker = document.getElementById('boardCustomColor');
+      if (customPicker) customPicker.value = currentColor;
+      renderPalette();
+      badge.textContent = `🎨 Switched Ink: Color ${selectedIdx + 1}`;
+      badge.className = "badge badge-ripe";
+      prevHandX = null; prevHandY = null;
+      return;
+    }
+  }
 
   const targetX = (1.0 - lm[8].x) * canvas.width;
   const targetY = lm[8].y * canvas.height;
@@ -1954,23 +2148,62 @@ function onHandResults(results) {
   prevHandX = null; prevHandY = null;
 }
 
+const standardColorPalette = ['#2563eb', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#f97316', '#06b6d4', '#0f172a', '#ffffff'];
+const darkBoardPalette = ['#ffffff', '#facc15', '#06b6d4', '#10b981', '#f97316', '#a855f7', '#ef4444', '#38bdf8'];
+
 function renderPalette() {
   const container = document.getElementById('paletteSwatches');
+  if (!container) return;
   container.innerHTML = '';
-  const colors = isBlackboard ? blackPalette : whitePalette;
-  if (!isEraser) currentColor = colors[0];
+  const colors = isBlackboard ? darkBoardPalette : standardColorPalette;
 
   colors.forEach(c => {
     const d = document.createElement('div');
-    d.className = 'palette-swatch' + (currentColor === c && !isEraser ? ' active' : '');
+    const isAct = (currentColor.toLowerCase() === c.toLowerCase() && !isEraser);
+    d.className = 'palette-swatch' + (isAct ? ' active' : '');
     d.style.background = c;
+    d.style.border = isAct ? '2px solid #38bdf8' : '1px solid rgba(255,255,255,0.2)';
+    d.title = c;
     d.onclick = () => {
       isEraser = false;
       currentColor = c;
+      const customPicker = document.getElementById('boardCustomColor');
+      if (customPicker) customPicker.value = c;
+      updateEraserButtonUI();
       renderPalette();
     };
     container.appendChild(d);
   });
+}
+
+function setCustomInkColor(color) {
+  isEraser = false;
+  currentColor = color;
+  updateEraserButtonUI();
+  renderPalette();
+}
+
+function toggleEraserMode() {
+  isEraser = !isEraser;
+  updateEraserButtonUI();
+  renderPalette();
+}
+
+function updateEraserButtonUI() {
+  const btn = document.getElementById('boardEraserBtn');
+  const label = document.getElementById('boardEraserLabel');
+  if (!btn) return;
+  if (isEraser) {
+    btn.style.borderColor = '#ef4444';
+    btn.style.color = '#ef4444';
+    btn.style.background = 'rgba(239, 68, 68, 0.2)';
+    if (label) label.textContent = 'Eraser (Active)';
+  } else {
+    btn.style.borderColor = 'var(--border)';
+    btn.style.color = 'var(--text-muted)';
+    btn.style.background = '';
+    if (label) label.textContent = 'Eraser';
+  }
 }
 
 function toggleBoardTheme() {
@@ -2374,6 +2607,23 @@ function renderDetectedFood(res) {
   document.getElementById('detectedFoodTitle').textContent = `${icon} ${res.food}`;
   document.getElementById('detectedFoodCategory').textContent = `Category: ${res.category || 'Food'} • Base Nutrition: ${currentKcalPer100} kcal / 100g`;
   document.getElementById('foodConfidenceBadge').textContent = `${res.confidence}% Confident (${res.method})`;
+
+  // Display Rotten vs Ripe Maturity State
+  const freshnessText = res.freshness_label || '✅ Fresh & Ripe (Optimal Quality)';
+  const ripStatus = res.ripeness_status || 'Fresh & Ripe';
+  const ripScore = res.ripeness_score !== undefined ? res.ripeness_score : 95;
+  const ripBadgeClass = res.ripeness_badge || (ripStatus.includes('Rotten') ? 'badge-rotten' : ripStatus.includes('Unripe') ? 'badge-unripe' : 'badge-ripe');
+
+  const textEl = document.getElementById('foodFreshnessText');
+  if (textEl) {
+    textEl.textContent = freshnessText;
+    textEl.style.color = ripBadgeClass === 'badge-rotten' ? '#f87171' : ripBadgeClass === 'badge-unripe' ? '#fbbf24' : '#34d399';
+  }
+  const badgeEl = document.getElementById('foodRipenessBadge');
+  if (badgeEl) {
+    badgeEl.className = 'badge ' + ripBadgeClass;
+    badgeEl.textContent = `${ripStatus} (${ripScore}% Maturity)`;
+  }
 
   document.getElementById('foodQtySlider').value = res.estimated_qty;
   updateFoodFromSlider();

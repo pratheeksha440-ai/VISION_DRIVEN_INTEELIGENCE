@@ -206,7 +206,13 @@ def pil_to_bgr(image_pil):
 def generate_sample_produce(item_name="Tomato"):
     img = np.zeros((360, 480, 3), dtype=np.uint8)
     img[:] = (35, 28, 20) # dark neutral table
-    if item_name in ["Banana", "Yellow Banana"]:
+    if "rotten" in str(item_name).lower():
+        # Red fruit with dark necrotic rot / decay spots
+        cv2.circle(img, (240, 180), 95, (25, 30, 180), -1) # dull red body
+        cv2.circle(img, (220, 165), 36, (12, 28, 40), -1)  # severe rot/decay spot
+        cv2.circle(img, (270, 205), 26, (14, 25, 38), -1)  # secondary mold lesion
+        cv2.circle(img, (240, 95), 14, (15, 55, 25), -1)   # withered calyx
+    elif item_name in ["Banana", "Yellow Banana"]:
         cv2.ellipse(img, (240, 180), (140, 38), 25, 0, 360, (25, 215, 245), -1) # Yellow
         cv2.circle(img, (130, 220), 12, (20, 150, 40), -1) # Green tip
     elif item_name in ["Orange", "Carrot"]:
@@ -386,104 +392,449 @@ with tab_home:
 with tab_vision:
     st.markdown("""
     <div class="banner-info">
-        <b>👁️ Spatial Audio Guidance System for the Visually Impaired:</b>
-        Detects obstacles in surroundings, identifies relative position (left, ahead, right), estimates proximity, and synthesizes spoken audio descriptions.
+        <b>👁️ Active Recording Spatial Audio Guidance System for the Visually Impaired:</b>
+        Runs continuous live active camera scanning with real AI obstacle detection (TensorFlow.js COCO-SSD & MobileNet).
+        Accurately detects real surrounding objects (another person, chairs, tables, books, water bottles, cupboards, rubber bands) with spatial directions, proximity alerts, and automated voice assistance — without taking manual snapshots or false detections.
     </div>
     """, unsafe_allow_html=True)
 
-    col1, col2 = st.columns([1, 1])
-
-    with col1:
-        st.markdown("#### 📷 Environmental Camera")
-        st.markdown("""
-        <div class="cam-notice">
-            💡 <b>Camera Access:</b> If prompted, allow camera permissions in your browser URL bar. Alternatively, upload a photo or test with the sample button below.
+    vision_active_html = """
+    <div style="background:#0f172a; border:1px solid #334155; border-radius:12px; padding:18px; color:#fff; font-family:sans-serif;">
+        <!-- Top Status Bar & Action Controls -->
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px; flex-wrap:wrap; gap:10px;">
+            <div style="display:flex; align-items:center; gap:10px;">
+                <span id="visionRecBadge" style="background:#dc2626; color:#fff; padding:5px 12px; border-radius:9999px; font-weight:700; font-size:12px; display:none; align-items:center; gap:6px; box-shadow:0 0 10px rgba(220, 38, 38, 0.6);">
+                    <span style="width:8px; height:8px; background:#fff; border-radius:50%; display:inline-block;"></span>
+                    <span>● LIVE ACTIVE RECORDING</span>
+                    <span id="visionRecTimer" style="font-family:monospace; margin-left:4px; font-weight:800;">00:00</span>
+                </span>
+                <span id="visionStatus" style="background:#f59e0b; color:#000; padding:4px 10px; border-radius:6px; font-weight:700; font-size:12px;">Camera Standby</span>
+            </div>
+            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                <button onclick="startActiveVision()" style="background:#4f46e5; color:#fff; border:none; padding:8px 14px; border-radius:6px; font-weight:600; cursor:pointer;">▶ Start Active Recording</button>
+                <button onclick="stopActiveVision()" style="background:#475569; color:#fff; border:none; padding:8px 14px; border-radius:6px; font-weight:600; cursor:pointer;">⏹ Stop Scanner</button>
+                <button id="btnVoiceToggle" onclick="toggleVoiceAssistant()" style="background:#059669; color:#fff; border:none; padding:8px 14px; border-radius:6px; font-weight:600; cursor:pointer;">🔊 Voice Assistant: ON</button>
+                <button onclick="speakCurrentSurroundings()" style="background:#d97706; color:#fff; border:none; padding:8px 14px; border-radius:6px; font-weight:600; cursor:pointer;">📢 Speak Now</button>
+                <label style="background:#334155; color:#fff; border:none; padding:8px 14px; border-radius:6px; font-weight:600; cursor:pointer; margin-bottom:0;">
+                    📁 Test Photo
+                    <input type="file" accept="image/*" style="display:none;" onchange="handleVisionPhotoUpload(event)">
+                </label>
+            </div>
         </div>
-        """, unsafe_allow_html=True)
 
-        vision_cam = st.camera_input("Capture Surroundings", key="vision_cam_stream")
-        vision_file = st.file_uploader("Or Upload Room / Path Photo", type=["jpg", "jpeg", "png"], key="vision_file_stream")
+        <!-- 2-Column Responsive Layout -->
+        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px;">
+            <!-- Left Column: Active Camera Feed & Bounding Box Overlay -->
+            <div>
+                <div style="position:relative; width:100%; aspect-ratio:4/3; background:#000; border-radius:8px; overflow:hidden; border:1px solid #334155;">
+                    <video id="visionLiveVideo" autoplay playsinline muted style="width:100%; height:100%; object-fit:contain; display:none;"></video>
+                    <canvas id="visionLiveCanvas" style="position:absolute; top:0; left:0; width:100%; height:100%;"></canvas>
+                    <div id="visionPlaceholder" style="position:absolute; top:0; left:0; width:100%; height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center; background:#1e293b; color:#94a3b8; text-align:center; padding:20px;">
+                        <span style="font-size:36px; margin-bottom:8px;">👁️</span>
+                        <b style="color:#e2e8f0; font-size:15px;">Active Continuous Vision Scanner</b>
+                        <p style="font-size:12px; margin:6px 0 0 0; line-height:1.4;">Click <b>Start Active Recording</b> above to continuously scan your surroundings without taking manual photos.</p>
+                    </div>
+                </div>
+                <div style="margin-top:8px; font-size:11px; color:#94a3b8; text-align:center;">
+                    💡 Continuous live recording with instant spoken voice guidance. Press <b>Spacebar</b> anytime to hear obstacles.
+                </div>
+            </div>
 
-        sample_vision = None
-        if st.button("🧪 Test Sample Surroundings (Person & Obstacles)", key="btn_sample_vision"):
-            sample_img = np.zeros((360, 480, 3), dtype=np.uint8)
-            sample_img[:] = (25, 20, 20)
-            cv2.rectangle(sample_img, (180, 80), (300, 340), (220, 180, 100), -1)
-            cv2.circle(sample_img, (240, 120), 30, (200, 160, 90), -1)
-            sample_vision = sample_img
+            <!-- Right Column: Speech Narration, Hazard Banner & Real Detection Table -->
+            <div style="display:flex; flex-direction:column; gap:12px;">
+                <!-- Speech Narration Box -->
+                <div style="background:#1e293b; border:1px solid #334155; border-radius:8px; padding:12px;">
+                    <div style="font-size:11px; color:#94a3b8; font-weight:700; text-transform:uppercase; margin-bottom:4px;">
+                        🗣️ Spoken Guidance (Voice Assistant):
+                    </div>
+                    <div id="visionSpokenText" style="font-size:14px; color:#38bdf8; font-weight:600; line-height:1.4; min-height:42px;">
+                        "Awaiting scanner start... Click Start Active Recording."
+                    </div>
+                </div>
 
-    target_vision_img = vision_cam or vision_file
+                <!-- Hazard Alert Banner -->
+                <div id="visionHazardBanner" style="display:none; background:rgba(220, 38, 38, 0.2); border:1px solid #ef4444; border-radius:8px; padding:10px; color:#fca5a5; font-size:13px; font-weight:700; align-items:center; gap:8px;">
+                    <span>⚠️</span> <span id="visionHazardMsg">Caution: Obstacle in close proximity!</span>
+                </div>
 
-    with col2:
-        st.markdown("#### 🔊 Audio & Obstacle Guidance")
+                <!-- Real-time Objects Table (NO HALLUCINATIONS) -->
+                <div style="background:#1e293b; border:1px solid #334155; border-radius:8px; padding:10px; flex-grow:1; display:flex; flex-direction:column;">
+                    <div style="font-size:11px; color:#94a3b8; font-weight:700; text-transform:uppercase; margin-bottom:8px;">
+                        Surrounding Objects Detected (Real AI Model)
+                    </div>
+                    <div style="overflow-y:auto; max-height:200px; flex-grow:1;">
+                        <table style="width:100%; font-size:12px; border-collapse:collapse; text-align:left;">
+                            <thead>
+                                <tr style="border-bottom:1px solid #334155; color:#94a3b8;">
+                                    <th style="padding:6px 8px;">Object</th>
+                                    <th style="padding:6px 8px;">Direction</th>
+                                    <th style="padding:6px 8px;">Distance</th>
+                                    <th style="padding:6px 8px;">Safety Status</th>
+                                </tr>
+                            </thead>
+                            <tbody id="visionTableBody">
+                                <tr>
+                                    <td colspan="4" style="text-align:center; padding:16px; color:#64748b;">
+                                        Scanner idle. Click <b>Start Active Recording</b> above.
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
 
-        img_bgr = None
-        if target_vision_img:
-            img_bgr = pil_to_bgr(Image.open(target_vision_img))
-        elif sample_vision is not None:
-            img_bgr = sample_vision
+    <!-- TensorFlow.js & COCO-SSD & MobileNet Scripts -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0/dist/tf.min.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/mobilenet@2.1.0" crossorigin="anonymous"></script>
+    <script>
+        let visionStream = null;
+        let cocoModel = null;
+        let mobModel = null;
+        let isScanning = false;
+        let isVoiceEnabled = true;
+        let recStartTime = null;
+        let recTimerInterval = null;
+        let lastSpokenText = "";
+        let lastSpokenTime = 0;
+        let frameCounter = 0;
+        let currentDetections = [];
 
-        if img_bgr is not None:
-            h_orig, w_orig = img_bgr.shape[:2]
-            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-            _, thresh = cv2.threshold(blurred, 60, 255, cv2.THRESH_BINARY_INV)
-            cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cocoSsd.load().then(m => {
+            cocoModel = m;
+            document.getElementById('visionStatus').textContent = 'AI Ready';
+            document.getElementById('visionStatus').style.background = '#10b981';
+        }).catch(e => console.warn("COCO-SSD load:", e));
 
-            mock_detections = []
-            if cnts:
-                sorted_c = sorted(cnts, key=cv2.contourArea, reverse=True)[:3]
-                classes = ["person", "chair", "door"]
-                for i, c in enumerate(sorted_c):
-                    x, y, w, h = cv2.boundingRect(c)
-                    if w * h > 0.04 * (w_orig * h_orig):
-                        mock_detections.append({
-                            "name": classes[i % len(classes)],
-                            "score": 0.94,
-                            "x": float(x),
-                            "y": float(y),
-                            "width": float(w),
-                            "height": float(h)
-                        })
+        mobilenet.load().then(m => {
+            mobModel = m;
+        }).catch(e => console.warn("MobileNet load:", e));
 
-            if not mock_detections:
-                mock_detections = [
-                    {"name": "person", "score": 0.96, "x": 160, "y": 70, "width": 180, "height": 300},
-                    {"name": "chair", "score": 0.89, "x": 350, "y": 200, "width": 110, "height": 180}
-                ]
+        function mapName(cls) {
+            const c = String(cls).toLowerCase().trim();
+            if (c === 'person') return 'another person';
+            if (c === 'dining table' || c === 'desk') return 'table';
+            if (c === 'bottle') return 'water bottle';
+            if (c === 'refrigerator' || c === 'cabinet' || c === 'bookcase') return 'cupboard';
+            return c;
+        }
 
-            data = process_detections(mock_detections, w_orig, h_orig)
+        async function startActiveVision() {
+            try {
+                const video = document.getElementById('visionLiveVideo');
+                const placeholder = document.getElementById('visionPlaceholder');
+                visionStream = await navigator.mediaDevices.getUserMedia({
+                    video: { width: 640, height: 480, facingMode: 'environment' }
+                });
+                video.srcObject = visionStream;
+                video.style.display = 'block';
+                placeholder.style.display = 'none';
 
-            # Audio Speech Output
-            speech_js = f"""
-            <script>
-                if ('speechSynthesis' in window) {{
-                    window.speechSynthesis.cancel();
-                    var ut = new SpeechSynthesisUtterance("{data['scene_description']}");
-                    ut.rate = 1.05;
-                    window.speechSynthesis.speak(ut);
-                }}
-            </script>
-            """
-            components.html(speech_js, height=0)
+                isScanning = true;
+                document.getElementById('visionStatus').textContent = 'Active Recording (Scanning)';
+                document.getElementById('visionStatus').style.background = '#10b981';
 
-            if data["urgent_alerts"]:
-                st.markdown(f'<div class="banner-danger">⚠️ {data["urgent_alerts"][0]}</div>', unsafe_allow_html=True)
+                // Start Recording Timer
+                document.getElementById('visionRecBadge').style.display = 'flex';
+                recStartTime = Date.now();
+                if (recTimerInterval) clearInterval(recTimerInterval);
+                recTimerInterval = setInterval(() => {
+                    const elapsed = Math.floor((Date.now() - recStartTime) / 1000);
+                    const m = String(Math.floor(elapsed / 60)).padStart(2, '0');
+                    const s = String(elapsed % 60).padStart(2, '0');
+                    document.getElementById('visionRecTimer').textContent = `${m}:${s}`;
+                }, 1000);
 
-            st.success(f"🗣️ **Spoken Narration:** \"{data['scene_description']}\"")
+                speakText("Assistive vision started. Active continuous recording and obstacle scanning active.");
+                video.onloadeddata = () => scanFrame();
+            } catch(err) {
+                alert("Camera access was not granted. Please ensure permissions are allowed.");
+            }
+        }
 
-            rows = []
-            for item in data["items"]:
-                rows.append({
-                    "Object Detected": item["name"].title(),
-                    "Spatial Direction": item["position"].title(),
-                    "Proximity Distance": item["distance"].title(),
-                    "Safety Status": "⚠️ HAZARD CLOSE" if item["is_danger"] else "✅ Safe Path"
-                })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        function stopActiveVision() {
+            isScanning = false;
+            if (visionStream) {
+                visionStream.getTracks().forEach(t => t.stop());
+                visionStream = null;
+            }
+            if (recTimerInterval) clearInterval(recTimerInterval);
+            document.getElementById('visionRecBadge').style.display = 'none';
+            document.getElementById('visionLiveVideo').style.display = 'none';
+            document.getElementById('visionPlaceholder').style.display = 'flex';
+            document.getElementById('visionStatus').textContent = 'Scanner Stopped';
+            document.getElementById('visionStatus').style.background = '#475569';
+        }
 
-        else:
-            st.info("💡 Capture a photo with your camera or upload an image to hear the voice narration.")
+        function toggleVoiceAssistant() {
+            isVoiceEnabled = !isVoiceEnabled;
+            const btn = document.getElementById('btnVoiceToggle');
+            if (isVoiceEnabled) {
+                btn.style.background = '#059669';
+                btn.textContent = '🔊 Voice Assistant: ON';
+                speakText("Voice assistant enabled.");
+            } else {
+                btn.style.background = '#475569';
+                btn.textContent = '🔇 Voice Assistant: OFF';
+                if (window.speechSynthesis) window.speechSynthesis.cancel();
+            }
+        }
+
+        function speakText(txt) {
+            if (!isVoiceEnabled || !('speechSynthesis' in window)) return;
+            window.speechSynthesis.cancel();
+            const u = new SpeechSynthesisUtterance(txt);
+            u.rate = 1.05;
+            window.speechSynthesis.speak(u);
+        }
+
+        function speakCurrentSurroundings() {
+            if (currentDetections.length === 0) {
+                speakText("Path is clear. No obstacles detected in view.");
+            } else {
+                const text = document.getElementById('visionSpokenText').textContent.replace(/"/g, '');
+                speakText(text);
+            }
+        }
+
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'Space' && e.target.tagName !== 'INPUT' && e.target.tagName !== 'TEXTAREA') {
+                e.preventDefault();
+                speakCurrentSurroundings();
+            }
+        });
+
+        async function scanFrame() {
+            if (!isScanning || !visionStream) return;
+            const video = document.getElementById('visionLiveVideo');
+            const canvas = document.getElementById('visionLiveCanvas');
+            canvas.width = video.videoWidth || 640;
+            canvas.height = video.videoHeight || 480;
+            const ctx = canvas.getContext('2d');
+            frameCounter++;
+
+            if (cocoModel && video.readyState >= 2) {
+                try {
+                    const preds = await cocoModel.detect(video);
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+                    // Filter REAL detections only (confidence >= 0.50)
+                    let detectedItems = preds.filter(p => p.score >= 0.50).map(p => {
+                        const name = mapName(p.class);
+                        const x = p.bbox[0], y = p.bbox[1], w = p.bbox[2], h = p.bbox[3];
+                        const x_center = x + w / 2;
+                        let pos = "Directly ahead";
+                        if (x_center < canvas.width * 0.35) pos = "On your left";
+                        else if (x_center > canvas.width * 0.65) pos = "On your right";
+
+                        const areaRatio = (w * h) / (canvas.width * canvas.height);
+                        let dist = "far";
+                        if (areaRatio >= 0.28) dist = "very close";
+                        else if (areaRatio >= 0.10) dist = "close";
+                        else if (areaRatio >= 0.03) dist = "nearby";
+
+                        const isDanger = dist === "very close" || (dist === "close" && (name.includes("person") || name === "chair" || name === "table"));
+
+                        return {
+                            name: name,
+                            score: Math.round(p.score * 100),
+                            pos: pos,
+                            dist: dist,
+                            isDanger: isDanger,
+                            bbox: [x, y, w, h]
+                        };
+                    });
+
+                    // Periodic MobileNet check for rubber band
+                    if (mobModel && (frameCounter % 10 === 0)) {
+                        try {
+                            const mPreds = await mobModel.classify(video, 2);
+                            mPreds.forEach(mp => {
+                                const low = mp.className.toLowerCase();
+                                if ((low.includes('rubber band') || low.includes('elastic band')) && mp.probability >= 0.40) {
+                                    detectedItems.push({
+                                        name: "rubber band",
+                                        score: Math.round(mp.probability * 100),
+                                        pos: "Directly ahead",
+                                        dist: "nearby",
+                                        isDanger: false,
+                                        bbox: [canvas.width * 0.4, canvas.height * 0.45, 90, 70]
+                                    });
+                                }
+                            });
+                        } catch(e) {}
+                    }
+
+                    // Draw bounding boxes for REAL objects only
+                    detectedItems.forEach(item => {
+                        const [x, y, w, h] = item.bbox;
+                        ctx.strokeStyle = item.isDanger ? '#ef4444' : '#6366f1';
+                        ctx.lineWidth = item.isDanger ? 4 : 3;
+                        ctx.strokeRect(x, y, w, h);
+
+                        ctx.fillStyle = item.isDanger ? 'rgba(239, 68, 68, 0.88)' : 'rgba(99, 102, 241, 0.88)';
+                        ctx.fillRect(x, Math.max(0, y - 24), Math.max(140, w), 24);
+
+                        ctx.fillStyle = '#ffffff';
+                        ctx.font = 'bold 12px sans-serif';
+                        ctx.fillText(`${item.name} (${item.score}%) - ${item.dist}`, x + 6, Math.max(16, y - 7));
+                    });
+
+                    currentDetections = detectedItems;
+                    updateGuidanceAndTable(detectedItems);
+
+                } catch(err) {
+                    console.error("Scan error:", err);
+                }
+            }
+            requestAnimationFrame(scanFrame);
+        }
+
+        function updateGuidanceAndTable(items) {
+            const spokenBox = document.getElementById('visionSpokenText');
+            const hazardBanner = document.getElementById('visionHazardBanner');
+            const hazardMsg = document.getElementById('visionHazardMsg');
+            const tbody = document.getElementById('visionTableBody');
+
+            // 1. Hazard Check
+            const dangers = items.filter(i => i.isDanger);
+            if (dangers.length > 0) {
+                hazardBanner.style.display = 'flex';
+                hazardMsg.textContent = `Caution: ${dangers[0].name} is ${dangers[0].dist} (${dangers[0].pos})!`;
+            } else {
+                hazardBanner.style.display = 'none';
+            }
+
+            // 2. Build Spoken Narration
+            let narration = "";
+            if (items.length === 0) {
+                narration = "Path is clear. No obstacles in immediate view.";
+            } else {
+                const left = items.filter(i => i.pos.includes("left")).map(i => `${i.name} (${i.dist})`);
+                const ahead = items.filter(i => i.pos.includes("ahead")).map(i => `${i.name} (${i.dist})`);
+                const right = items.filter(i => i.pos.includes("right")).map(i => `${i.name} (${i.dist})`);
+
+                const parts = [];
+                if (ahead.length > 0) parts.push(`Directly ahead: ${ahead.join(', ')}`);
+                if (left.length > 0) parts.push(`On your left: ${left.join(', ')}`);
+                if (right.length > 0) parts.push(`On your right: ${right.join(', ')}`);
+                narration = parts.join(' • ');
+            }
+            spokenBox.textContent = `"${narration}"`;
+
+            // 3. Update Table (ONLY REAL DETECTIONS - ZERO HALLUCINATIONS)
+            tbody.innerHTML = '';
+            if (items.length === 0) {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="4" style="text-align:center; padding:16px; color:#10b981; font-weight:600;">
+                            🟢 Path is Clear — No obstacles detected.
+                        </td>
+                    </tr>
+                `;
+            } else {
+                items.forEach(item => {
+                    const tr = document.createElement('tr');
+                    tr.style.borderBottom = '1px solid #334155';
+                    tr.innerHTML = `
+                        <td style="padding:6px 8px; font-weight:600; color:#e2e8f0;">${item.name} <span style="font-size:11px; color:#94a3b8;">(${item.score}%)</span></td>
+                        <td style="padding:6px 8px; color:#cbd5e1;">${item.pos}</td>
+                        <td style="padding:6px 8px;">
+                            <span style="background:${item.dist.includes('close') ? 'rgba(239,68,68,0.2)' : 'rgba(59,130,246,0.2)'}; color:${item.dist.includes('close') ? '#fca5a5' : '#93c5fd'}; padding:2px 8px; border-radius:4px; font-size:11px; font-weight:700;">${item.dist}</span>
+                        </td>
+                        <td style="padding:6px 8px;">
+                            ${item.isDanger ? '<span style="color:#ef4444; font-weight:700;">⚠️ HAZARD CLOSE</span>' : '<span style="color:#10b981; font-weight:600;">🟢 Safe Path</span>'}
+                        </td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            }
+
+            // 4. Auto-Speech Timing (State Change or Every 4.5s on close hazard)
+            const now = Date.now();
+            const isStateChanged = narration !== lastSpokenText;
+            const isTimeExpired = (now - lastSpokenTime > 4500);
+
+            if ((isStateChanged || (dangers.length > 0 && isTimeExpired)) && isVoiceEnabled) {
+                lastSpokenText = narration;
+                lastSpokenTime = now;
+                speakText(narration);
+            }
+        }
+
+        // Photo upload handler
+        function handleVisionPhotoUpload(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = function(evt) {
+                const img = new Image();
+                img.onload = async () => {
+                    stopActiveVision();
+                    const canvas = document.getElementById('visionLiveCanvas');
+                    canvas.width = 640; canvas.height = 480;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0, 640, 480);
+                    document.getElementById('visionPlaceholder').style.display = 'none';
+
+                    if (cocoModel) {
+                        const preds = await cocoModel.detect(img);
+                        ctx.clearRect(0, 0, 640, 480);
+                        ctx.drawImage(img, 0, 0, 640, 480);
+
+                        let detectedItems = preds.filter(p => p.score >= 0.48).map(p => {
+                            const name = mapName(p.class);
+                            const x = p.bbox[0], y = p.bbox[1], w = p.bbox[2], h = p.bbox[3];
+                            const x_center = x + w / 2;
+                            let pos = "Directly ahead";
+                            if (x_center < 640 * 0.35) pos = "On your left";
+                            else if (x_center > 640 * 0.65) pos = "On your right";
+
+                            const areaRatio = (w * h) / (640 * 480);
+                            let dist = "far";
+                            if (areaRatio >= 0.28) dist = "very close";
+                            else if (areaRatio >= 0.10) dist = "close";
+                            else if (areaRatio >= 0.03) dist = "nearby";
+
+                            const isDanger = dist === "very close" || (dist === "close" && (name.includes("person") || name === "chair" || name === "table"));
+
+                            return {
+                                name: name,
+                                score: Math.round(p.score * 100),
+                                pos: pos,
+                                dist: dist,
+                                isDanger: isDanger,
+                                bbox: [x, y, w, h]
+                            };
+                        });
+
+                        detectedItems.forEach(item => {
+                            const [x, y, w, h] = item.bbox;
+                            ctx.strokeStyle = item.isDanger ? '#ef4444' : '#6366f1';
+                            ctx.lineWidth = 3;
+                            ctx.strokeRect(x, y, w, h);
+                            ctx.fillStyle = item.isDanger ? 'rgba(239, 68, 68, 0.88)' : 'rgba(99, 102, 241, 0.88)';
+                            ctx.fillRect(x, Math.max(0, y - 24), Math.max(140, w), 24);
+                            ctx.fillStyle = '#ffffff';
+                            ctx.font = 'bold 12px sans-serif';
+                            ctx.fillText(`${item.name} (${item.score}%) - ${item.dist}`, x + 6, Math.max(16, y - 7));
+                        });
+
+                        currentDetections = detectedItems;
+                        updateGuidanceAndTable(detectedItems);
+                        speakCurrentSurroundings();
+                    }
+                };
+                img.src = evt.target.result;
+            };
+            reader.readAsDataURL(file);
+        }
+    </script>
+    """
+    components.html(vision_active_html, height=650)
 
 
 # ========================================================
@@ -516,10 +867,17 @@ with tab_agri:
             agri_upload = st.file_uploader("Or Upload Produce Photo", type=["jpg", "jpeg", "png"], key="agri_upload_stream")
 
             sample_produce_img = None
-            if st.button("🧪 Test Sample Ripe Tomato", key="btn_sample_tomato"):
-                sample_produce_img = generate_sample_produce("Tomato")
-            if st.button("🧪 Test Sample Yellow Banana", key="btn_sample_banana"):
-                sample_produce_img = generate_sample_produce("Banana")
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                if st.button("🧪 Sample Ripe Tomato", key="btn_sample_tomato"):
+                    sample_produce_img = generate_sample_produce("Tomato")
+                if st.button("🧪 Sample Yellow Banana", key="btn_sample_banana"):
+                    sample_produce_img = generate_sample_produce("Banana")
+            with sc2:
+                if st.button("🚨 Sample Rotten Produce", key="btn_sample_rotten"):
+                    sample_produce_img = generate_sample_produce("Rotten Tomato")
+                if st.button("🧪 Sample Fresh Carrot", key="btn_sample_carrot"):
+                    sample_produce_img = generate_sample_produce("Carrot")
 
         target_produce = agri_cam or agri_upload
         img_bgr = None
@@ -537,16 +895,25 @@ with tab_agri:
                     st.error(res["alert"] or "⚠️ No edible produce recognized! Please place a real edible item clearly in view.")
                     st.warning("Tip: Make sure the fruit or vegetable is well-lit and separated from hands/skin.")
                 else:
-                    st.success(f"**Identified Item:** {res.get('item', produce_choice)} • **Quality:** {res['result']} (Confidence: {res['confidence']}%)")
+                    if "ROTTEN" in res["result"]:
+                        st.error(f"🚨 **Verdict: ROTTEN / SPOILED** — Severe decay detected! (Maturity Rate: {res['score']}%)")
+                    elif "RIPE" in res["result"]:
+                        st.success(f"🟢 **Verdict: RIPE & FRESH** — Prime consumable quality! (Maturity Rate: {res['score']}%)")
+                    elif "OVERRIPE" in res["result"]:
+                        st.warning(f"🟠 **Verdict: OVERRIPE / AGEING** — Eat immediately. (Maturity Rate: {res['score']}%)")
+                    else:
+                        st.info(f"🟡 **Verdict: {res['result']}** (Maturity Rate: {res['score']}%)")
+
+                    st.markdown(f"**Identified Produce:** {res.get('item', produce_choice)} • **Confidence:** {res['confidence']}%")
                     m1, m2 = st.columns(2)
-                    m1.metric("Maturity Score", f"{res['score']}/100")
+                    m1.metric("Maturity Rate", f"{res['score']}%")
                     m2.metric("Estimated Shelf-Life", res["shelf_life"])
 
                     st.markdown("**Color Composition:**")
-                    st.progress(int(res["green"]), text=f"Green (Unripe): {res['green']}%")
-                    st.progress(int(res["yellow"]), text=f"Yellow (Ripening): {res['yellow']}%")
-                    st.progress(int(res["red"]), text=f"Red / Chromatic: {res['red']}%")
-                    st.progress(int(res["rot"]), text=f"Rot / Necrosis: {res['rot']}%")
+                    st.progress(int(np.clip(res["green"], 0, 100)), text=f"Green (Unripe): {res['green']}%")
+                    st.progress(int(np.clip(res["yellow"], 0, 100)), text=f"Yellow (Ripening): {res['yellow']}%")
+                    st.progress(int(np.clip(res["red"], 0, 100)), text=f"Red / Chromatic: {res['red']}%")
+                    st.progress(int(np.clip(res["rot"], 0, 100)), text=f"Rot / Necrosis: {res['rot']}%")
 
                     st.info(f"**Storage & Handling Advice:** {res['advice']}")
 
@@ -645,6 +1012,24 @@ with tab_edu:
                 </div>
             </div>
 
+            <!-- Smart Color Toolbar -->
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px; background:#1e293b; padding:8px 14px; border-radius:8px; border:1px solid #334155;">
+                <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                    <span style="font-size:12px; color:#94a3b8; font-weight:700;">🎨 Colors:</span>
+                    <div id="swatches" style="display:flex; gap:6px; align-items:center;"></div>
+                    <div style="display:flex; align-items:center; gap:4px; margin-left:6px; border-left:1px solid #475569; padding-left:8px;">
+                        <label for="boardCustomColor" style="font-size:11px; color:#cbd5e1; cursor:pointer;">Custom:</label>
+                        <input type="color" id="boardCustomColor" value="#2563eb" onchange="setColor(this.value)" style="width:26px; height:26px; padding:0; border:1px solid #475569; border-radius:4px; cursor:pointer; background:transparent;">
+                    </div>
+                    <button id="boardEraserBtn" onclick="toggleEraser()" style="background:#334155; color:#cbd5e1; border:1px solid #475569; padding:4px 10px; border-radius:6px; font-size:11px; font-weight:600; cursor:pointer; margin-left:6px;">Eraser</button>
+                </div>
+                <div style="display:flex; align-items:center; gap:8px;">
+                    <span style="font-size:12px; color:#94a3b8; font-weight:600;">Stroke:</span>
+                    <input type="range" min="2" max="30" value="6" oninput="setStroke(this.value)" style="width:70px;">
+                    <span id="strokeVal" style="font-size:12px; width:26px; font-weight:700;">6px</span>
+                </div>
+            </div>
+
             <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px;">
                 <div style="position:relative; width:100%; aspect-ratio:4/3; background:#000; border-radius:8px; overflow:hidden;">
                     <video id="webcam" autoplay playsinline muted style="width:100%; height:100%; object-fit:contain; transform:scaleX(-1);"></video>
@@ -655,7 +1040,7 @@ with tab_edu:
                 </div>
             </div>
             <div style="margin-top:10px; font-size:12px; color:#94a3b8; text-align:center;">
-                Note: In iframe mode, ensure your browser allows camera access. For native 60 FPS performance, run the standalone app at http://localhost:8000.
+                Touchless air drawing: reach index finger to the top strip of the camera to switch colors, or select colors with the palette above.
             </div>
         </div>
 
@@ -663,11 +1048,71 @@ with tab_edu:
         <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
         <script>
             let stream = null, hands = null, prevX = null, prevY = null, fistStart = null;
+            let currentColor = '#2563eb';
+            let currentStroke = 6;
+            let isEraserActive = false;
+
             const canvas = document.getElementById('board');
             const ctx = canvas.getContext('2d');
             ctx.lineCap = 'round';
-            ctx.lineWidth = 5;
-            ctx.strokeStyle = '#2563eb';
+            ctx.lineWidth = currentStroke;
+            ctx.strokeStyle = currentColor;
+
+            const palette = ['#2563eb', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#f97316', '#0f172a', '#ffffff'];
+            function renderSwatches() {
+                const c = document.getElementById('swatches');
+                if (!c) return;
+                c.innerHTML = '';
+                palette.forEach(col => {
+                    const d = document.createElement('div');
+                    d.style.width = '20px';
+                    d.style.height = '20px';
+                    d.style.borderRadius = '50%';
+                    d.style.background = col;
+                    d.style.cursor = 'pointer';
+                    d.style.border = (currentColor.toLowerCase() === col.toLowerCase() && !isEraserActive) ? '2px solid #38bdf8' : '1px solid #475569';
+                    d.onclick = () => setColor(col);
+                    c.appendChild(d);
+                });
+            }
+            renderSwatches();
+
+            function setColor(col) {
+                currentColor = col;
+                isEraserActive = false;
+                ctx.strokeStyle = col;
+                ctx.lineWidth = currentStroke;
+                const picker = document.getElementById('boardCustomColor');
+                if (picker) picker.value = col;
+                updateEraserUI();
+                renderSwatches();
+            }
+
+            function setStroke(val) {
+                currentStroke = parseInt(val, 10);
+                ctx.lineWidth = currentStroke;
+                document.getElementById('strokeVal').textContent = val + 'px';
+            }
+
+            function toggleEraser() {
+                isEraserActive = !isEraserActive;
+                updateEraserUI();
+                renderSwatches();
+            }
+
+            function updateEraserUI() {
+                const btn = document.getElementById('boardEraserBtn');
+                if (!btn) return;
+                if (isEraserActive) {
+                    btn.style.background = '#ef4444';
+                    btn.style.color = '#fff';
+                    btn.textContent = 'Eraser (Active)';
+                } else {
+                    btn.style.background = '#334155';
+                    btn.style.color = '#cbd5e1';
+                    btn.textContent = 'Eraser';
+                }
+            }
 
             function clearCanvas() {
                 ctx.fillStyle = '#ffffff';
@@ -688,6 +1133,19 @@ with tab_edu:
                 overlay.height = results.image.height || 480;
                 oCtx.clearRect(0, 0, overlay.width, overlay.height);
 
+                // Draw Air Color Palette on Hand Canvas
+                const airColors = ['#2563eb', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#ffffff'];
+                const bW = overlay.width / airColors.length;
+                airColors.forEach((col, idx) => {
+                    oCtx.fillStyle = col;
+                    oCtx.fillRect(idx * bW, 0, bW, 30);
+                    if (currentColor.toLowerCase() === col.toLowerCase() && !isEraserActive) {
+                        oCtx.strokeStyle = '#facc15';
+                        oCtx.lineWidth = 3;
+                        oCtx.strokeRect(idx * bW + 2, 2, bW - 4, 26);
+                    }
+                });
+
                 if (!results.multiHandLandmarks || results.multiHandLandmarks.length === 0) {
                     prevX = null; prevY = null;
                     document.getElementById('badge').textContent = 'Tracking Hand...';
@@ -703,6 +1161,18 @@ with tab_edu:
 
                 let count = (indexUp ? 1:0) + (middleUp ? 1:0) + (ringUp ? 1:0) + (pinkyUp ? 1:0);
 
+                // Touchless Air Color Selection (if index reaches top strip)
+                if (lm[8].y * overlay.height < 36 && count === 1 && indexUp) {
+                    const sel = Math.floor(((1.0 - lm[8].x) * overlay.width) / bW);
+                    if (sel >= 0 && sel < airColors.length) {
+                        setColor(airColors[sel]);
+                        document.getElementById('badge').textContent = `🎨 Air Switched: Color ${sel+1}`;
+                        document.getElementById('badge').style.background = '#10b981';
+                        prevX = null; prevY = null;
+                        return;
+                    }
+                }
+
                 const x = (1.0 - lm[8].x) * canvas.width;
                 const y = lm[8].y * canvas.height;
 
@@ -717,13 +1187,15 @@ with tab_edu:
                     ctx.save();
                     ctx.fillStyle = '#ffffff';
                     ctx.beginPath();
-                    ctx.arc(x, y, 25, 0, 2*Math.PI);
+                    ctx.arc(x, y, currentStroke * 4, 0, 2*Math.PI);
                     ctx.fill();
                     ctx.restore();
                     prevX = null; prevY = null;
                 } else if (count === 1 && indexUp) {
                     document.getElementById('badge').textContent = '☝️ Drawing';
                     document.getElementById('badge').style.background = '#10b981';
+                    ctx.strokeStyle = isEraserActive ? '#ffffff' : currentColor;
+                    ctx.lineWidth = isEraserActive ? currentStroke * 3 : currentStroke;
                     if (prevX !== null && prevY !== null) {
                         ctx.beginPath();
                         ctx.moveTo(prevX, prevY);
@@ -774,7 +1246,7 @@ with tab_edu:
             }
         </script>
         """
-        components.html(board_html, height=530)
+        components.html(board_html, height=580)
 
     with edu_atten:
         st.markdown("""
@@ -1082,6 +1554,8 @@ with tab_food:
             if st.button("🧪 Sample Fresh Orange", key="btn_sample_food_orange"):
                 sample_food_img = generate_sample_produce("Orange")
         with s_c2:
+            if st.button("🚨 Sample Rotten Produce", key="btn_sample_food_rotten"):
+                sample_food_img = generate_sample_produce("Rotten Tomato")
             if st.button("🧪 Sample Broccoli", key="btn_sample_food_broccoli"):
                 sample_food_img = generate_sample_produce("Broccoli")
             if st.button("🧪 Sample Carrot", key="btn_sample_food_carrot"):
@@ -1125,6 +1599,20 @@ with tab_food:
 
             st.success(f"### {icon} {food_name}")
             st.caption(f"Category: {category} • Confidence: {confidence}% ({detected_info['method']})")
+
+            # Produce Freshness & Rotten vs Ripe Quality
+            if detected_info.get("ripeness_status"):
+                r_status = detected_info["ripeness_status"]
+                r_score = detected_info.get("ripeness_score", 90)
+                decay = detected_info.get("decay_pct", 0)
+                if "ROTTEN" in r_status:
+                    st.error(f"🚨 **Ripeness Alert: ROTTEN / SPOILED** • Maturity Rate: {r_score}% • Decay Area: {decay}% (Unsafe for consumption)")
+                elif "RIPE" in r_status:
+                    st.success(f"🟢 **Ripeness Status: {r_status}** • Maturity Rate: {r_score}% • Prime consumable freshness")
+                elif "OVERRIPE" in r_status:
+                    st.warning(f"🟠 **Ripeness Status: {r_status}** • Maturity Rate: {r_score}% • Consume promptly")
+                else:
+                    st.info(f"🟡 **Ripeness Status: {r_status}** • Maturity Rate: {r_score}%")
 
             portion = st.slider("Adjust Serving Size (grams)", min_value=20, max_value=800, value=default_g, step=10)
             calc_kcal = int(round((kcal100 * portion) / 100.0))

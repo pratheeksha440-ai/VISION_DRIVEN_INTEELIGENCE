@@ -199,177 +199,212 @@ def recognize_food_from_image(image_bgr, label_hint=None):
     chromatic signatures, and neural candidate predictions.
     """
     # 1. Check Neural Classifier Hints (MobileNet, COCO, etc.)
+    matched_from_hint = None
     if label_hint:
         hints = [h.strip().lower() for h in str(label_hint).replace(";", ",").split(",")]
         for h in hints:
             for k, canonical in FOOD_LABEL_MAP.items():
                 if k in h or h in k:
-                    portion = DEFAULT_PORTIONS.get(canonical, 120)
-                    return {
-                        "food": canonical,
-                        "confidence": 96,
-                        "estimated_qty": portion,
-                        "method": f"Neural Identification ({canonical})"
-                    }
+                    matched_from_hint = canonical
+                    break
+            if matched_from_hint:
+                break
 
     if image_bgr is None or image_bgr.size == 0:
-        return {"food": "Apple", "confidence": 75, "estimated_qty": 150, "method": "Default"}
+        return {
+            "food": matched_from_hint or "Apple",
+            "confidence": 75,
+            "estimated_qty": 150,
+            "method": "Default",
+            "ripeness_status": "Fresh & Ripe",
+            "ripeness_score": 95,
+            "freshness_label": "✅ Fresh & Ripe (Optimal)",
+            "ripeness_badge": "badge-ripe"
+        }
 
     # 2. Multi-Band Chromatic & Morphological Feature Extraction
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-    h, s, v = cv2.split(hsv)
+    h_chan, s_chan, v_chan = cv2.split(hsv)
     total_pixels = max(1, image_bgr.shape[0] * image_bgr.shape[1])
 
-    # Saturated produce pixels
-    sat_mask = (s > 40) & (v > 35) & (v < 250)
+    # Saturated produce pixels (filters out neutral walls, dark tables & glare)
+    sat_mask = (s_chan >= 60) & (v_chan >= 40) & (v_chan <= 250)
+    produce_mask = sat_mask
     produce_px = max(1, np.count_nonzero(sat_mask))
-
-    # Color band distributions over produce pixels
-    def pct_band(cond):
-        return np.count_nonzero(cond & sat_mask) / produce_px
-
-    p_red = pct_band((h < 12) | (h > 165))
-    p_orange = pct_band((h >= 12) & (h < 22))
-    p_yellow = pct_band((h >= 22) & (h < 36))
-    p_dgreen = pct_band((h >= 36) & (h <= 85) & (s > 70))
-    p_lgreen = pct_band((h >= 36) & (h <= 85) & (s <= 70))
-    p_purple = pct_band((h >= 120) & (h <= 160))
-    p_brown_tan = pct_band((h >= 10) & (h <= 26) & (s < 90) & (v < 180))
-    p_white = np.count_nonzero((s < 35) & (v > 160)) / total_pixels
-
-    # Shape aspect ratio & circularity of dominant contour
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 220, 255, cv2.THRESH_BINARY_INV)
-    cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     aspect_ratio = 1.0
     circularity = 0.8
+
+    # Segment dominant foreground produce contour (rejecting human skin if hand-held)
+    k_clean = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    clean_sat = cv2.morphologyEx((sat_mask.astype(np.uint8) * 255), cv2.MORPH_CLOSE, k_clean)
+    cnts, _ = cv2.findContours(clean_sat, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
     if cnts:
-        c = max(cnts, key=cv2.contourArea)
-        area = cv2.contourArea(c)
-        peri = cv2.arcLength(c, True)
-        if peri > 0:
-            circularity = (4 * np.pi * area) / (peri * peri)
-        x, y, bw, bh = cv2.boundingRect(c)
-        aspect_ratio = max(bw, bh) / max(1.0, min(bw, bh))
+        for c in sorted(cnts, key=cv2.contourArea, reverse=True):
+            c_area = cv2.contourArea(c)
+            if c_area < 400:
+                continue
+            mask_c = np.zeros(hsv.shape[:2], dtype=np.uint8)
+            cv2.drawContours(mask_c, [c], -1, 255, -1)
+            # Human skin detection (H: 0-25, S: 30-150, V: 80-255)
+            skin_mask = (h_chan >= 0) & (h_chan <= 25) & (s_chan >= 30) & (s_chan <= 150) & (v_chan >= 80) & (mask_c > 0)
+            skin_ratio = np.count_nonzero(skin_mask) / max(1, c_area)
+            if skin_ratio > 0.68:
+                continue  # User hand/arm, skip to produce
 
-    # 3. Botanical Produce Classification Rules
-    matched = "Apple"
-    conf = 88
+            peri = cv2.arcLength(c, True)
+            if peri > 0:
+                circularity = (4 * np.pi * c_area) / (peri * peri)
+            x, y, bw, bh = cv2.boundingRect(c)
+            aspect_ratio = max(bw, bh) / max(1.0, min(bw, bh))
+            produce_mask = (mask_c > 0) & sat_mask
+            produce_px = max(1, np.count_nonzero(produce_mask))
+            break
 
-    # A. Red Produce (Tomato, Apple, Strawberry, Pomegranate, Beetroot, Red Chili)
-    if p_red > 0.30:
-        if aspect_ratio > 2.2:
-            matched = "Chili"
-            conf = 92
-        elif p_dgreen > 0.08 or circularity > 0.82:
-            matched = "Tomato"
-            conf = 95
-        elif p_yellow > 0.08:
-            matched = "Apple"
-            conf = 91
-        elif circularity < 0.65:
-            matched = "Strawberry"
-            conf = 90
-        else:
-            matched = "Pomegranate"
-            conf = 89
+    # Color band distributions over segmented produce pixels
+    def pct_band(cond):
+        return np.count_nonzero(cond & produce_mask) / produce_px
 
-    # B. Yellow / Golden Produce (Banana, Mango, Lemon, Pineapple, Corn)
-    elif p_yellow > 0.32:
-        if aspect_ratio > 2.0:
-            matched = "Banana"
-            conf = 96
-        elif p_dgreen > 0.08:
-            matched = "Mango"
-            conf = 92
-        elif circularity > 0.85:
-            matched = "Lemon"
-            conf = 93
-        elif aspect_ratio > 1.4:
-            matched = "Corn"
-            conf = 90
-        else:
-            matched = "Pineapple"
-            conf = 89
+    p_red = pct_band((h_chan < 12) | (h_chan > 165))
+    p_orange = pct_band((h_chan >= 12) & (h_chan < 22))
+    p_yellow = pct_band((h_chan >= 22) & (h_chan < 36))
+    p_dgreen = pct_band((h_chan >= 36) & (h_chan <= 85) & (s_chan > 65))
+    p_lgreen = pct_band((h_chan >= 36) & (h_chan <= 85) & (s_chan <= 65))
+    p_purple = pct_band((h_chan >= 120) & (h_chan <= 160))
+    p_brown_tan = pct_band((h_chan >= 8) & (h_chan <= 24) & (s_chan < 90) & (v_chan < 160))
+    p_white = np.count_nonzero((s_chan < 35) & (v_chan > 160)) / total_pixels
 
-    # C. Orange Produce (Carrot, Orange, Papaya, Pumpkin, Sweet Potato)
-    elif p_orange > 0.28:
-        if aspect_ratio > 2.2:
-            matched = "Carrot"
-            conf = 95
-        elif circularity > 0.82:
-            matched = "Orange"
-            conf = 94
-        elif aspect_ratio > 1.3:
-            matched = "Papaya"
-            conf = 91
-        else:
-            matched = "Pumpkin"
-            conf = 89
-
-    # D. Green Produce (Cucumber, Capsicum, Broccoli, Cabbage, Okra, Zucchini, Peas, Spinach)
-    elif (p_dgreen + p_lgreen) > 0.35:
-        if aspect_ratio > 2.8:
-            matched = "Cucumber"
-            conf = 94
-        elif aspect_ratio > 2.0:
-            matched = "Okra"
-            conf = 92
-        elif p_dgreen > 0.40 and circularity < 0.65:
-            matched = "Broccoli"
-            conf = 95
-        elif circularity > 0.80:
-            matched = "Capsicum"
-            conf = 93
-        elif p_lgreen > 0.35:
-            matched = "Cabbage"
-            conf = 91
-        else:
-            matched = "Spinach"
-            conf = 89
-
-    # E. Purple / Dark Produce (Eggplant, Grapes, Plum)
-    elif p_purple > 0.18:
-        if aspect_ratio > 1.8:
-            matched = "Eggplant"
-            conf = 94
-        elif circularity > 0.80:
-            matched = "Plum"
-            conf = 90
-        else:
-            matched = "Grapes"
-            conf = 92
-
-    # F. White / Tan / Earthy Produce (Potato, Onion, Garlic, Mushroom, Cauliflower)
-    elif p_white > 0.25 or p_brown_tan > 0.35:
-        if circularity < 0.65 and p_white > 0.20:
-            matched = "Cauliflower"
-            conf = 92
-        elif aspect_ratio < 1.3 and p_brown_tan > 0.25:
-            matched = "Potato"
-            conf = 93
-        elif circularity > 0.85:
-            matched = "Onion"
-            conf = 91
-        elif p_white > 0.35:
-            matched = "Garlic"
-            conf = 90
-        else:
-            matched = "Mushroom"
-            conf = 89
-
-    # Default fallback
+    # 3. Botanical Produce Classification (if not matched by hint)
+    if matched_from_hint:
+        matched = matched_from_hint
+        conf = 96
+        method = f"Neural Identification ({matched})"
     else:
-        matched = "Apple"
-        conf = 85
+        method = "Multi-Spectral Botanical Classifier"
+        mean_v = float(np.mean(v_chan[produce_mask]))
+
+        # A. Dual-band Red & Green (Watermelon)
+        if p_red > 0.20 and (p_dgreen + p_lgreen) > 0.15:
+            matched, conf = "Watermelon", 95
+
+        # B. Red Produce (Pomegranate, Tomato, Apple, Strawberry, Chili, Beetroot)
+        elif p_red > 0.25:
+            if aspect_ratio > 2.2:
+                matched, conf = "Chili", 92
+            elif circularity < 0.70 and aspect_ratio > 1.2:
+                matched, conf = "Strawberry", 93
+            elif p_dgreen > 0.04:  # Tomato often has a distinct green calyx / stem
+                matched, conf = "Tomato", 95
+            elif p_yellow > 0.08:  # Apple typically has yellow/green blush striations
+                matched, conf = "Apple", 93
+            elif circularity > 0.84 and mean_v > 140:  # Smooth, glossy bright red tomato
+                matched, conf = "Tomato", 94
+            else:  # Deep ruby / crimson orb with crown calyx
+                matched, conf = "Pomegranate", 95
+
+        # C. Yellow / Golden Produce (Banana, Mango, Lemon, Pineapple, Corn)
+        elif p_yellow > 0.25:
+            if aspect_ratio > 1.45:
+                matched, conf = "Banana", 96
+            elif p_dgreen > 0.06 or (aspect_ratio > 1.2 and circularity < 0.82):
+                matched, conf = "Mango", 93
+            elif circularity > 0.82:
+                matched, conf = "Lemon", 94
+            elif aspect_ratio > 1.8:
+                matched, conf = "Corn", 90
+            else:
+                matched, conf = "Pineapple", 91
+
+        # D. Orange Produce (Carrot, Orange, Papaya, Pumpkin, Sweet Potato)
+        elif p_orange > 0.25:
+            if aspect_ratio > 2.0:
+                matched, conf = "Carrot", 95
+            elif circularity > 0.82:
+                matched, conf = "Orange", 95
+            elif aspect_ratio > 1.3:
+                matched, conf = "Papaya", 91
+            else:
+                matched, conf = "Pumpkin", 90
+
+        # E. Dark Forest Green to Brown-Black (Avocado)
+        elif (p_dgreen > 0.18 or p_brown_tan > 0.20) and mean_v < 90 and aspect_ratio < 1.6:
+            matched, conf = "Avocado", 92
+
+        # F. Green Produce (Cucumber, Capsicum, Broccoli, Cabbage, Okra, Zucchini, Spinach)
+        elif (p_dgreen + p_lgreen) > 0.28:
+            if aspect_ratio > 1.8:
+                matched, conf = "Cucumber", 95
+            elif p_dgreen > 0.38 and circularity < 0.68:
+                matched, conf = "Broccoli", 95
+            elif circularity > 0.80 and aspect_ratio < 1.25:
+                matched, conf = "Capsicum", 93
+            elif p_lgreen > 0.35:
+                matched, conf = "Cabbage", 91
+            elif circularity < 0.75:
+                matched, conf = "Capsicum", 92
+            else:
+                matched, conf = "Spinach", 89
+
+        # G. Purple / Dark Produce (Eggplant, Grapes, Plum)
+        elif p_purple > 0.18:
+            if aspect_ratio > 1.7:
+                matched, conf = "Eggplant", 95
+            elif circularity > 0.80:
+                matched, conf = "Plum", 91
+            else:
+                matched, conf = "Grapes", 93
+
+        # H. White / Tan / Earthy Produce (Potato, Onion, Garlic, Mushroom, Cauliflower)
+        elif p_white > 0.25 or p_brown_tan > 0.30:
+            if circularity < 0.65 and p_white > 0.20:
+                matched, conf = "Cauliflower", 93
+            elif aspect_ratio < 1.35 and p_brown_tan > 0.22:
+                matched, conf = "Potato", 93
+            elif circularity > 0.82:
+                matched, conf = "Onion", 92
+            elif p_white > 0.35:
+                matched, conf = "Garlic", 91
+            else:
+                matched, conf = "Mushroom", 90
+        else:
+            matched, conf = "Apple", 85
+
+    # 4. Accurate Rotten vs Ripe vs Unripe Analysis
+    dark_decay = (h_chan >= 5) & (h_chan <= 24) & (s_chan >= 35) & (v_chan < 115) & sat_mask
+    decay_pct = (np.count_nonzero(dark_decay) / produce_px) * 100.0
+
+    if decay_pct >= 9.0:
+        rip_status = "Rotten / Spoiled"
+        rip_score = max(8, int(25 - decay_pct * 1.5))
+        rip_label = "🚨 Rotten / Spoiled (Unsafe to eat)"
+        rip_badge = "badge-rotten"
+    elif decay_pct >= 4.0:
+        rip_status = "Overripe"
+        rip_score = 58
+        rip_label = "⚠️ Overripe (Consume today)"
+        rip_badge = "badge-unripe"
+    elif p_dgreen > 0.40 and matched in {"Tomato", "Banana", "Mango", "Papaya", "Peach"}:
+        rip_status = "Unripe"
+        rip_score = 42
+        rip_label = "🌱 Unripe (Ready in 3-5 days)"
+        rip_badge = "badge-unripe"
+    else:
+        rip_status = "Fresh & Ripe"
+        rip_score = 96
+        rip_label = "✅ Fresh & Ripe (Optimal Quality)"
+        rip_badge = "badge-ripe"
 
     portion = DEFAULT_PORTIONS.get(matched, 120)
     return {
         "food": matched,
         "confidence": conf,
         "estimated_qty": portion,
-        "method": "Multi-Spectral Botanical Classifier"
+        "method": method,
+        "ripeness_status": rip_status,
+        "ripeness_score": rip_score,
+        "freshness_label": rip_label,
+        "ripeness_badge": rip_badge
     }
 
 

@@ -20,7 +20,7 @@ PRODUCE_LIST = [
 ]
 
 CANDIDATE_ITEMS = [
-    "Tomato", "Banana", "Apple", "Mango", "Orange", "Carrot", "Cucumber",
+    "Pomegranate", "Apple", "Tomato", "Banana", "Orange", "Mango", "Carrot", "Cucumber",
     "Capsicum", "Strawberry", "Broccoli", "Cauliflower", "Potato", "Onion",
     "Avocado", "Brinjal", "Lemon", "Watermelon", "Pineapple"
 ]
@@ -32,67 +32,93 @@ VEGETABLES = {
 }
 
 RULES = {
-    "Tomato":   (25, 12),
-    "Banana":   (35, 15),
-    "Mango":    (30, 15),
-    "Avocado":  (30, 15),
-    "Capsicum": (25, 12),
-    "Cucumber": (25, 12),
-    "Carrot":   (25, 12),
-    "Brinjal":  (25, 12),
+    "Pomegranate": (25, 12),
+    "Apple":      (25, 12),
+    "Tomato":     (25, 12),
+    "Banana":     (35, 15),
+    "Mango":      (30, 15),
+    "Orange":     (25, 12),
+    "Avocado":    (30, 15),
+    "Capsicum":   (25, 12),
+    "Cucumber":   (25, 12),
+    "Carrot":     (25, 12),
+    "Brinjal":    (25, 12),
+    "Strawberry": (20, 10),
+    "Broccoli":   (25, 12),
 }
 
 VEG_YELLOW = {"Capsicum": 30, "Cucumber": 25}
 
 ADVICE = {
     "UNRIPE": (
-        "Not ready yet. Keep at room temperature, away from direct sun, and check again in a few days.",
-        "Ready in about 3-7 days",
+        "🌱 UNRIPE: High chlorophyll content and developing firmness. Keep at room temperature away from direct sunlight to allow natural sugar development.",
+        "Ready in 4-7 days",
     ),
     "PARTIALLY RIPE": (
-        "Almost ready. Good for transport or storage; it will finish ripening shortly.",
-        "Ready in about 1-3 days",
+        "🟡 PARTIALLY RIPE: Maturing nicely with early carotenoid/anthocyanin color transition. Excellent for storage or transport; will reach peak ripeness shortly.",
+        "Ready in 1-3 days",
     ),
     "RIPE": (
-        "Best stage to eat, harvest or sell. Refrigerate to slow further ripening if not used immediately.",
-        "Use within about 2-4 days",
+        "✅ OPTIMAL RIPENESS: Peak nutritional quality, aroma, and natural sweetness. Best stage to consume, harvest, or serve.",
+        "Use within 2-4 days (Refrigerate)",
     ),
     "OVERRIPE": (
-        "Past its best. Use quickly for cooking, juice, sauce or smoothies, or sell at a reduced price.",
-        "Use within about 1 day",
+        "⚠️ OVERRIPE: Past peak firmness with softening tissue and high sugar browning. Best used today for cooking, purees, or smoothies.",
+        "Use within 24 hours",
     ),
     "ROTTEN": (
-        "Spoiled. Do not sell or eat. Remove it from other produce to prevent the rot from spreading.",
-        "Discard now",
+        "🚨 ROTTEN / SPOILED: Pathological decay, fungal browning, or necrotic softening detected. Unsafe for consumption. Isolate and discard immediately.",
+        "Discard now (Do not eat)",
     ),
     "FRESH": (
-        "Fresh and good quality. Store in a cool place or the fridge crisper and use within a few days.",
-        "Use within about 3-7 days",
+        "✅ CRISP & FRESH: Vibrant chlorophyll, firm cell structure, and prime market freshness. Store in a cool crisper drawer.",
+        "Use within 3-7 days",
     ),
     "AGEING": (
-        "Starting to age or wilt. Use soon in cooking and cut away any soft or discoloured parts.",
-        "Use within about 1-2 days",
+        "⚠️ AGEING / WILTED: Beginning to lose cellular turgor and crispness with slight chlorosis/softness. Consume soon in cooked dishes.",
+        "Use within 1-2 days",
     ),
     "SPOILED": (
-        "Spoiled. Do not sell or eat. Remove it from other produce to prevent the rot from spreading.",
-        "Discard now",
+        "🚨 SPOILED / ROTTEN: Severe bacterial or fungal decay detected. Remove from other produce to prevent pathogen spread.",
+        "Discard immediately",
     ),
     "NOT FOUND": (
-        "⚠️ No edible fruit or vegetable recognized! Please place a real edible item (Tomato, Banana, Mango, Cucumber, etc.) in view with good lighting.",
+        "⚠️ No edible fruit or vegetable recognized! Please place a real edible item clearly in view with good lighting.",
         "-",
     ),
 }
 
+CLIMACTERIC_FRUITS = {
+    "Tomato", "Banana", "Mango", "Papaya", "Peach", "Pear", "Plum", "Apple",
+    "Guava", "Avocado", "Kiwi", "Melon", "Apricot", "Custard Apple"
+}
+
+GREEN_VEGETABLES = {
+    "Cucumber", "Capsicum", "Broccoli", "Cabbage", "Spinach", "Okra", "Zucchini",
+    "Peas", "Green Beans", "Lettuce", "Asparagus", "Celery", "Bitter Gourd", "Bottle Gourd"
+}
+
+CITRUS_FRUITS = {"Orange", "Lemon", "Lime", "Grapefruit"}
+BERRIES_AND_RED = {"Strawberry", "Cherry", "Pomegranate", "Grapes", "Watermelon", "Beetroot", "Apple"}
+
 # Color signatures expected for each edible item (H ranges in HSV [0..179])
 PRODUCE_COLOR_SIGNATURES = {
-    "Tomato": {"hues": [(0, 18), (160, 179), (35, 85)], "min_sat": 50},   # Red, orange-red, or unripe green
-    "Banana": {"hues": [(20, 38), (35, 80), (5, 20)], "min_sat": 45},     # Yellow, green tips, ripe spots
-    "Mango": {"hues": [(15, 38), (35, 85), (0, 15)], "min_sat": 50},      # Yellow, orange, green, red blush
-    "Avocado": {"hues": [(30, 85), (5, 25), (0, 180)], "min_sat": 20},    # Dark green to deep brown
-    "Capsicum": {"hues": [(35, 88), (0, 18), (18, 35)], "min_sat": 55},   # Green, red, or yellow pepper
-    "Cucumber": {"hues": [(35, 88), (20, 35)], "min_sat": 40},            # Green, ageing yellow
-    "Carrot": {"hues": [(8, 26)], "min_sat": 70},                          # Vivid orange
-    "Brinjal": {"hues": [(120, 160), (0, 20), (35, 85)], "min_sat": 25},  # Deep violet, dark purple, green calyx
+    "Pomegranate": {"hues": [(0, 18), (160, 179), (12, 25)], "min_sat": 45}, # Deep crimson, ruby red, crown calyx
+    "Apple": {"hues": [(0, 18), (160, 179), (35, 80), (18, 35)], "min_sat": 45}, # Red, yellow/green blush
+    "Tomato": {"hues": [(0, 18), (160, 179), (35, 85)], "min_sat": 50},      # Glossy red, orange-red, unripe green
+    "Banana": {"hues": [(20, 38), (35, 80), (5, 20)], "min_sat": 45},        # Yellow, green tips, ripe spots
+    "Mango": {"hues": [(15, 38), (35, 85), (0, 15)], "min_sat": 50},         # Yellow, orange, green, red blush
+    "Orange": {"hues": [(10, 26)], "min_sat": 60},                            # Vibrant citrus orange
+    "Strawberry": {"hues": [(0, 18), (160, 179)], "min_sat": 55},             # Vivid red
+    "Avocado": {"hues": [(30, 85), (8, 25)], "min_sat": 30},                  # Dark forest green to brown-black
+    "Capsicum": {"hues": [(35, 88), (0, 18), (18, 35)], "min_sat": 55},      # Green, red, or yellow pepper
+    "Cucumber": {"hues": [(35, 88), (20, 35)], "min_sat": 40},               # Medium-dark green, ageing yellow
+    "Broccoli": {"hues": [(35, 85)], "min_sat": 45},                         # Deep green floret cluster
+    "Carrot": {"hues": [(8, 26)], "min_sat": 65},                             # Vivid orange
+    "Brinjal": {"hues": [(120, 160), (0, 20), (35, 85)], "min_sat": 25},     # Deep violet, dark purple, green calyx
+    "Eggplant": {"hues": [(120, 160), (0, 20), (35, 85)], "min_sat": 25},
+    "Potato": {"hues": [(10, 28)], "min_sat": 25},
+    "Onion": {"hues": [(10, 25), (140, 170)], "min_sat": 25},
 }
 
 def validate_edible_item(img_hsv, contour, item):
@@ -115,7 +141,7 @@ def validate_edible_item(img_hsv, contour, item):
     aspect_ratio = max(w, h) / max(1.0, min(w, h))
 
     # Elongated vs round produce checks
-    if item in ["Tomato", "Apple", "Mango", "Avocado"]:
+    if item in ["Tomato", "Apple", "Mango", "Avocado", "Pomegranate", "Orange", "Plum", "Peach"]:
         if aspect_ratio > 3.0:
             return False, f"Shape is too elongated for a {item}"
     elif item in ["Banana", "Cucumber", "Carrot"]:
@@ -168,8 +194,11 @@ def _analyze_single_item(image_bgr, item="Tomato"):
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
 
-    # Filter out dull backgrounds & very dark noise
-    mask = ((s > 38) & (v > 30)).astype(np.uint8) * 255
+    # Filter out dull backgrounds & low-saturation surfaces
+    if item in {"Potato", "Cauliflower", "Garlic", "Mushroom", "Onion", "Radish"}:
+        mask = ((s >= 22) & (v >= 50)).astype(np.uint8) * 255
+    else:
+        mask = ((s >= 55) & (v >= 40)).astype(np.uint8) * 255
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
@@ -227,9 +256,18 @@ def _analyze_single_item(image_bgr, item="Tomato"):
     brightness = float(np.median(v[m]))
     rel = v.astype(np.float32) / max(brightness, 1.0)
     coloured = s > 40
-    dark = (rel < 0.45) & m
-    brown = coloured & (h >= 5) & (h <= 22) & (rel < 0.70) & m
-    rot_mask = brown if item == "Avocado" else (dark | brown)
+    dark = (rel < 0.38) & (v < 40) & m
+    brown = coloured & (h >= 6) & (h <= 24) & (s >= 35) & (v < 110) & m
+
+    # Pathological rot is necrotic brown/fungal softness.
+    # Natural 3D shading on red produce (pomegranate, tomato, apple) preserves rich red hue and is NOT rot.
+    is_red_produce = item in BERRIES_AND_RED or item in {"Tomato", "Apple"}
+    if is_red_produce:
+        rot_mask = brown & (s < 140)
+    elif item == "Avocado":
+        rot_mask = brown
+    else:
+        rot_mask = (dark | brown)
 
     rot_u8 = rot_mask.astype(np.uint8) * 255
     rot_u8 = cv2.morphologyEx(rot_u8, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
@@ -249,42 +287,99 @@ def _analyze_single_item(image_bgr, item="Tomato"):
     yellow = pct(coloured & (h >= 20) & (h < 35))
     red = pct(coloured & ((h < 20) | (h >= 165)))
 
-    rotten_t, over_t = RULES.get(item, (25, 12))
-
-    if is_veg:
-        yellow_t = VEG_YELLOW.get(item)
-        if rot >= rotten_t:
-            result = "SPOILED"
-            margin = rot - rotten_t
-        elif rot >= over_t:
-            result = "AGEING"
-            margin = min(rot - over_t, rotten_t - rot)
-        elif yellow_t is not None and yellow >= yellow_t:
-            result = "AGEING"
-            margin = yellow - yellow_t
-        else:
-            result = "FRESH"
-            margin = over_t - rot
-            if yellow_t is not None:
-                margin = min(margin, yellow_t - yellow)
-        score = 100 - min(100, rot * 2 + (yellow * 0.5 if yellow_t else 0))
+    # Calibrated rotten & overripe thresholds based on biological susceptibility
+    if item in {"Strawberry", "Tomato", "Banana", "Peach", "Plum"}:
+        rotten_t = 8.0
+        over_t = 3.5
+    elif item in {"Pomegranate", "Apple", "Potato", "Pumpkin", "Onion", "Carrot", "Beetroot", "Eggplant"}:
+        rotten_t = 14.0
+        over_t = 6.0
     else:
-        if rot >= rotten_t:
-            result = "ROTTEN"
-            margin = rot - rotten_t
-        elif green >= 50:
-            result = "UNRIPE"
-            margin = min(green - 50, rotten_t - rot)
-        elif green >= 20:
-            result = "PARTIALLY RIPE"
-            margin = min(green - 20, 50 - green, rotten_t - rot)
-        elif rot >= over_t:
-            result = "OVERRIPE"
-            margin = min(rot - over_t, rotten_t - rot, 20 - green)
+        rotten_t = 10.0
+        over_t = 4.5
+        rotten_t = 10.0
+        over_t = 4.5
+
+    # Determine Result & Accurate Maturity Score
+    if rot >= rotten_t:
+        result = "SPOILED" if is_veg else "ROTTEN"
+        score = max(5.0, 25.0 - (rot - rotten_t) * 1.5)
+        margin = rot - rotten_t
+    elif rot >= over_t:
+        result = "AGEING" if is_veg else "OVERRIPE"
+        score = max(35.0, 65.0 - (rot - over_t) * 3.5)
+        margin = min(rot - over_t, rotten_t - rot)
+    else:
+        # Healthy produce (rot < over_t)
+        if item in GREEN_VEGETABLES:
+            # High green = high freshness
+            if green >= 45.0:
+                result = "FRESH"
+                score = min(98.0, 88.0 + (green - 45.0) * 0.18)
+                margin = green - 45.0
+            elif yellow >= 22.0:
+                result = "AGEING"
+                score = max(40.0, 65.0 - (yellow - 22.0) * 1.5)
+                margin = yellow - 22.0
+            else:
+                result = "FRESH"
+                score = 86.0
+                margin = 12.0
+        elif item in CLIMACTERIC_FRUITS:
+            # Fruits that transition from green to carotenoid/lycopene
+            if green >= 38.0:
+                result = "UNRIPE"
+                score = max(25.0, 50.0 - (green - 38.0) * 0.8)
+                margin = green - 38.0
+            elif green >= 14.0:
+                result = "PARTIALLY RIPE"
+                score = 65.0 + (38.0 - green) * 0.7
+                margin = min(green - 14.0, 38.0 - green)
+            else:
+                result = "RIPE"
+                score = min(98.0, 88.0 + (yellow + red) * 0.12)
+                margin = 14.0 - green
+        elif item in CITRUS_FRUITS:
+            if item in {"Lime"}:
+                result = "RIPE"
+                score = 92.0
+                margin = 20.0
+            elif (yellow + red) >= 35.0:
+                result = "RIPE"
+                score = min(98.0, 88.0 + (yellow + red - 35.0) * 0.15)
+                margin = (yellow + red) - 35.0
+            else:
+                result = "PARTIALLY RIPE"
+                score = 65.0
+                margin = 15.0
+        elif item in BERRIES_AND_RED:
+            if red >= 30.0:
+                result = "RIPE"
+                score = min(98.0, 90.0 + (red - 30.0) * 0.15)
+                margin = red - 30.0
+            elif green >= 25.0:
+                result = "UNRIPE"
+                score = 45.0
+                margin = green - 25.0
+            else:
+                result = "PARTIALLY RIPE"
+                score = 72.0
+                margin = 15.0
         else:
-            result = "RIPE"
-            margin = min(20 - green, over_t - rot)
-        score = (100 - green) + rot * 0.5
+            # Universal fallback for any other fruit or vegetable
+            if is_veg:
+                result = "FRESH"
+                score = max(80.0, 95.0 - rot * 3.0)
+                margin = 20.0
+            else:
+                if green >= 35.0:
+                    result = "UNRIPE"
+                    score = 45.0
+                    margin = green - 35.0
+                else:
+                    result = "RIPE"
+                    score = min(98.0, 90.0 + (red + yellow) * 0.1)
+                    margin = 20.0
 
     confidence = float(np.clip(55 + margin * 2.5, 55, 99))
     advice_text, shelf_life = ADVICE.get(result, ADVICE["NOT FOUND"])
@@ -335,6 +430,21 @@ def analyze_ripeness(image_bgr, item="Auto-Detect", label_hint=None):
             pass
 
     if not item or item in ["Auto-Detect", "Auto", "Any", "Edible Item"]:
+        # 1. Use the Botanical Produce & Food Recognition Engine to accurately classify the item
+        try:
+            from food_engine import recognize_food_from_image
+            recognized = recognize_food_from_image(image_bgr, label_hint=label_hint)
+            identified_food = recognized.get("food")
+            if identified_food and identified_food not in ["Edible Item", "Unknown"]:
+                res = _analyze_single_item(image_bgr, identified_food)
+                if res["detected"]:
+                    res["confidence"] = max(res["confidence"], float(recognized.get("confidence", 88)))
+                    res["item"] = identified_food
+                    return res
+        except Exception as e:
+            pass
+
+        # 2. Candidate evaluation fallback
         best_candidate = None
         for cand in CANDIDATE_ITEMS:
             res = _analyze_single_item(image_bgr, cand)
