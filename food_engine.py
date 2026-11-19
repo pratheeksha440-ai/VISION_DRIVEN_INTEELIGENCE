@@ -4,10 +4,10 @@ This module keeps the same public interface as the original food_engine.py:
 FOOD_DATA, FOOD_LABEL_MAP, DEFAULT_PORTIONS, recognize_food_from_image,
 FoodTrackingSession and food_session.
 
-Recognition uses labels supplied by the browser's MobileNet model first, then
-uses conservative OpenCV colour/shape clues for common whole produce. A generic
-image classifier cannot reliably identify every recipe or mixed meal; uncertain
-images are returned as Unknown food rather than being falsely labelled Apple.
+Recognition uses labels supplied by the browser's MobileNet model. It does not
+guess a food from image colour, because mixed meals can be incorrectly labelled
+as fruits (for example, a South Indian meal being labelled Orange). Uncertain
+images are returned as Unknown food rather than a false food name.
 Calorie values are approximate reference values per 100 g.
 """
 
@@ -195,8 +195,9 @@ def recognize_food_from_image(image_bgr, label_hint=None):
     confidence = 72 if matched else 0
 
     if not matched:
-        matched, confidence = _colour_produce_guess(image_bgr)
-        method = "Conservative colour-based produce estimate" if matched else "No reliable food match"
+        # Never infer a food from dominant colour. This caused mixed meals such
+        # as South Indian thalis to be incorrectly classified as Orange/Banana.
+        method = "No reliable food match - food-specific model needed"
 
     if not matched:
         return {"food": "Unknown food", "confidence": 0, "estimated_qty": 100,
