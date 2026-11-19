@@ -31,12 +31,13 @@ def decode_b64_image(b64_str):
 async def api_ripeness(request):
     try:
         body = await request.json()
-        item = body.get("item", "Tomato")
+        item = body.get("item", "Auto-Detect")
+        label_hint = body.get("label_hint", "")
         img_b64 = body.get("image", "")
         img = decode_b64_image(img_b64)
         if img is None:
             return JSONResponse({"error": "Invalid image data"}, status_code=400)
-        res = analyze_ripeness(img, item)
+        res = analyze_ripeness(img, item, label_hint)
         return JSONResponse(res)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -72,7 +73,9 @@ async def api_attention_eval(request):
         mar = float(body.get("mar", 0.40))
         is_closed = bool(body.get("eyes_closed", False))
         is_yawning = bool(body.get("yawning", False))
-        res = classroom_session.evaluate_face(sid, ear, mar, is_closed, is_yawning)
+        movement = float(body.get("movement", 0.0))
+        gaze = str(body.get("gaze", "Center"))
+        res = classroom_session.evaluate_face(sid, ear, mar, is_closed, is_yawning, movement, gaze)
         summary = classroom_session.get_summary()
         return JSONResponse({"student": res, "summary": summary})
     except Exception as e:
@@ -94,7 +97,6 @@ async def api_food_recognize(request):
         if img is None:
             return JSONResponse({"error": "Invalid image data"}, status_code=400)
         res = recognize_food_from_image(img, label_hint)
-        # Populate nutritional details
         food_name = res["food"]
         if food_name in FOOD_DATA:
             res["category"] = FOOD_DATA[food_name]["category"]
@@ -149,7 +151,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AI Multi-Domain Suite (Assistive Vision, Agriculture, Air-Board, Food Tracker)</title>
+<title>AI Multi-Domain Intelligence Suite</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
 
 <!-- TensorFlow.js & Models (COCO-SSD & MobileNet) -->
@@ -187,23 +189,26 @@ body { background: var(--bg-main); color: var(--text-main); min-height: 100vh; d
 header {
   background: #060913;
   border-bottom: 1px solid var(--border);
-  padding: 16px 28px;
+  padding: 14px 28px;
   display: flex;
   justify-content: space-between;
   align-items: center;
   flex-wrap: wrap;
   gap: 12px;
+  position: sticky;
+  top: 0;
+  z-index: 50;
 }
-.brand { display: flex; align-items: center; gap: 12px; }
+.brand { display: flex; align-items: center; gap: 12px; cursor: pointer; }
 .brand i { font-size: 26px; color: var(--primary); }
-.brand h1 { font-size: 20px; font-weight: 700; }
-.brand span { font-size: 13px; color: var(--text-muted); display: block; }
+.brand h1 { font-size: 19px; font-weight: 700; }
+.brand span { font-size: 12px; color: var(--text-muted); display: block; }
 
 .status-badge {
   background: rgba(16, 185, 129, 0.15);
   color: #34d399;
   border: 1px solid rgba(16, 185, 129, 0.3);
-  padding: 6px 14px;
+  padding: 5px 12px;
   border-radius: 9999px;
   font-size: 12px;
   font-weight: 600;
@@ -225,18 +230,19 @@ nav.domain-tabs {
   background: transparent;
   border: none;
   color: var(--text-muted);
-  padding: 16px 20px;
+  padding: 15px 18px;
   font-size: 14px;
   font-weight: 600;
   cursor: pointer;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 9px;
   border-bottom: 3px solid transparent;
   transition: all 0.2s ease;
   white-space: nowrap;
 }
 .tab-btn:hover { color: var(--text-main); }
+.tab-btn.active.home-tab { color: #38bdf8; border-bottom-color: #38bdf8; }
 .tab-btn.active.d1 { color: #818cf8; border-bottom-color: #818cf8; }
 .tab-btn.active.d2 { color: #34d399; border-bottom-color: #34d399; }
 .tab-btn.active.d3 { color: #fbbf24; border-bottom-color: #fbbf24; }
@@ -247,6 +253,100 @@ main { flex: 1; padding: 24px 28px; max-width: 1440px; margin: 0 auto; width: 10
 .domain-section { display: none; }
 .domain-section.active { display: block; animation: fadeIn 0.3s ease; }
 @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+
+/* ==========================================
+   LANDING PAGE STYLES
+   ========================================== */
+.hero-box {
+  background: linear-gradient(135deg, rgba(99, 102, 241, 0.12) 0%, rgba(16, 185, 129, 0.08) 50%, rgba(245, 158, 11, 0.06) 100%);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 36px 32px;
+  text-align: center;
+  margin-bottom: 32px;
+}
+.hero-box h2 { font-size: 32px; font-weight: 800; color: #f8fafc; margin-bottom: 10px; }
+.hero-box p { font-size: 16px; color: var(--text-muted); max-width: 800px; margin: 0 auto 20px auto; line-height: 1.5; }
+.hero-stats { display: flex; justify-content: center; gap: 14px; flex-wrap: wrap; }
+.stat-pill {
+  background: rgba(15, 23, 42, 0.6);
+  border: 1px solid var(--border);
+  padding: 6px 14px;
+  border-radius: 9999px;
+  font-size: 13px;
+  color: #cbd5e1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.stat-pill i { color: var(--primary); }
+
+.landing-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 24px;
+  margin-bottom: 32px;
+}
+@media (max-width: 900px) { .landing-grid { grid-template-columns: 1fr; } }
+
+.domain-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  transition: all 0.25s ease;
+  position: relative;
+  overflow: hidden;
+}
+.domain-card:hover {
+  transform: translateY(-4px);
+  border-color: #64748b;
+  box-shadow: 0 12px 24px rgba(0,0,0,0.35);
+}
+.domain-card-header { display: flex; align-items: flex-start; gap: 16px; margin-bottom: 14px; }
+.domain-icon-box {
+  width: 52px; height: 52px;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 24px;
+  flex-shrink: 0;
+}
+.icon-box-d1 { background: rgba(99, 102, 241, 0.15); color: #818cf8; border: 1px solid rgba(99, 102, 241, 0.3); }
+.icon-box-d2 { background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.3); }
+.icon-box-d3 { background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.3); }
+.icon-box-d4 { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
+
+.domain-card-title { font-size: 18px; font-weight: 700; color: #f8fafc; }
+.domain-card-badge {
+  font-size: 11px; font-weight: 700; text-transform: uppercase;
+  padding: 3px 8px; border-radius: 4px; display: inline-block; margin-top: 4px;
+}
+.domain-card-desc { font-size: 14px; color: var(--text-muted); line-height: 1.5; margin-bottom: 20px; }
+.domain-features-list { list-style: none; margin-bottom: 20px; font-size: 13px; color: #cbd5e1; }
+.domain-features-list li { margin-bottom: 6px; display: flex; align-items: center; gap: 8px; }
+.domain-features-list li i { font-size: 11px; }
+
+.launch-btn {
+  background: var(--bg-card-sub);
+  color: #fff;
+  border: 1px solid var(--border);
+  padding: 10px 18px;
+  border-radius: 8px;
+  font-weight: 600;
+  font-size: 14px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  transition: all 0.2s;
+}
+.launch-btn:hover { background: var(--primary); border-color: var(--primary); }
 
 /* Grid Layouts */
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
@@ -302,7 +402,7 @@ main { flex: 1; padding: 24px 28px; max-width: 1440px; margin: 0 auto; width: 10
   width: 100%; height: 100%;
   object-fit: contain;
 }
-.camera-placeholder { color: var(--text-muted); text-align: center; z-index: 1; }
+.camera-placeholder { color: var(--text-muted); text-align: center; z-index: 1; padding: 16px; }
 .camera-placeholder i { font-size: 40px; margin-bottom: 10px; opacity: 0.5; }
 
 /* Buttons & Inputs */
@@ -418,11 +518,11 @@ tr:hover { background: rgba(255, 255, 255, 0.02); }
 <body>
 
 <header>
-  <div class="brand">
+  <div class="brand" onclick="switchDomain('landing', document.querySelector('.home-tab'))">
     <i class="fa-solid fa-microchip"></i>
     <div>
-      <h1>Multi-Domain AI Suite (v2.5)</h1>
-      <span>Assistive Vision for Blind &bull; Precision Agriculture &bull; Gesture Teaching Board &bull; Auto Food Reader</span>
+      <h1>Multi-Domain AI Suite</h1>
+      <span>Assistive Vision &bull; Precision Agriculture &bull; Air-Board &bull; Auto Food Reader</span>
     </div>
   </div>
   <div class="status-badge">
@@ -432,7 +532,10 @@ tr:hover { background: rgba(255, 255, 255, 0.02); }
 </header>
 
 <nav class="domain-tabs">
-  <button class="tab-btn active d1" onclick="switchDomain('d1', this)">
+  <button class="tab-btn active home-tab" onclick="switchDomain('landing', this)">
+    <i class="fa-solid fa-house"></i> Home / Overview
+  </button>
+  <button class="tab-btn d1" onclick="switchDomain('d1', this)">
     <i class="fa-solid fa-eye-low-vision"></i> Domain 1: Vision Assistant (Blind Support)
   </button>
   <button class="tab-btn d2" onclick="switchDomain('d2', this)">
@@ -442,16 +545,150 @@ tr:hover { background: rgba(255, 255, 255, 0.02); }
     <i class="fa-solid fa-hand-pointer"></i> Domain 3: Smart Education (Air-Board & Monitor)
   </button>
   <button class="tab-btn d4" onclick="switchDomain('d4', this)">
-    <i class="fa-solid fa-apple-whole"></i> Domain 4: Auto Food Tracker (Camera)
+    <i class="fa-solid fa-apple-whole"></i> Domain 4: Auto Food Tracker
   </button>
 </nav>
 
 <main>
 
   <!-- ======================================================== -->
+  <!-- LANDING PAGE (PORTAL & SUITE OVERVIEW)                   -->
+  <!-- ======================================================== -->
+  <section id="landingPage" class="domain-section active">
+    <div class="hero-box">
+      <h2>Four Multimodal AI Domains. One Unified Suite.</h2>
+      <p>
+        An integrated platform fusing real-time computer vision, client-side neural edge classification, 
+        and spatial perception to solve everyday challenges across accessibility, agriculture, education, and health.
+      </p>
+      <div class="hero-stats">
+        <span class="stat-pill"><i class="fa-solid fa-bolt"></i> 4 Autonomous Engines</span>
+        <span class="stat-pill"><i class="fa-solid fa-eye"></i> Spatial Assistive Vision</span>
+        <span class="stat-pill"><i class="fa-solid fa-hand-sparkles"></i> 60 FPS Air-Drawing</span>
+        <span class="stat-pill"><i class="fa-solid fa-utensils"></i> Zero-Dropdown Food Reader</span>
+      </div>
+    </div>
+
+    <div class="landing-grid">
+      <!-- Domain 1 Card -->
+      <div class="domain-card">
+        <div>
+          <div class="domain-card-header">
+            <div class="domain-icon-box icon-box-d1">
+              <i class="fa-solid fa-eye-low-vision"></i>
+            </div>
+            <div>
+              <div class="domain-card-title">Domain 1: Assistive Vision</div>
+              <span class="domain-card-badge icon-box-d1">For Visually Impaired</span>
+            </div>
+          </div>
+          <div class="domain-card-desc">
+            Designed specifically for the blind: continuous 360° obstacle tracking, spatial direction (left/ahead/right), proximity hazard sirens, and instant spoken scene narration.
+          </div>
+          <ul class="domain-features-list">
+            <li><i class="fa-solid fa-check text-indigo-400"></i> Real-time COCO-SSD 80-class object detection</li>
+            <li><i class="fa-solid fa-check text-indigo-400"></i> Continuous hands-free voice navigation</li>
+            <li><i class="fa-solid fa-check text-indigo-400"></i> Proximity acoustic alarm for close hazards</li>
+            <li><i class="fa-solid fa-check text-indigo-400"></i> Tap anywhere on screen to speak surroundings</li>
+          </ul>
+        </div>
+        <button class="launch-btn" onclick="switchDomain('d1', document.querySelector('.tab-btn.d1'))">
+          <span>Enter Vision Assistant Studio</span>
+          <i class="fa-solid fa-arrow-right"></i>
+        </button>
+      </div>
+
+      <!-- Domain 2 Card -->
+      <div class="domain-card">
+        <div>
+          <div class="domain-card-header">
+            <div class="domain-icon-box icon-box-d2">
+              <i class="fa-solid fa-wheat-awn"></i>
+            </div>
+            <div>
+              <div class="domain-card-title">Domain 2: Precision Agriculture</div>
+              <span class="domain-card-badge icon-box-d2">Ripeness & Pathology</span>
+            </div>
+          </div>
+          <div class="domain-card-desc">
+            Dual agricultural intelligence: accurately validates edible produce (rejecting hands/skin/non-food), evaluates ripeness/shelf-life, and diagnoses crop leaf diseases via live camera.
+          </div>
+          <ul class="domain-features-list">
+            <li><i class="fa-solid fa-check text-emerald-400"></i> Strict edible validation with false-positive alerts</li>
+            <li><i class="fa-solid fa-check text-emerald-400"></i> Multi-band HSV ripeness & shelf-life prediction</li>
+            <li><i class="fa-solid fa-check text-emerald-400"></i> Live optical camera crop leaf disease scanner</li>
+            <li><i class="fa-solid fa-check text-emerald-400"></i> 15+ plant diseases with treatments & precautions</li>
+          </ul>
+        </div>
+        <button class="launch-btn" onclick="switchDomain('d2', document.querySelector('.tab-btn.d2'))">
+          <span>Enter Agriculture Studio</span>
+          <i class="fa-solid fa-arrow-right"></i>
+        </button>
+      </div>
+
+      <!-- Domain 3 Card -->
+      <div class="domain-card">
+        <div>
+          <div class="domain-card-header">
+            <div class="domain-icon-box icon-box-d3">
+              <i class="fa-solid fa-hand-pointer"></i>
+            </div>
+            <div>
+              <div class="domain-card-title">Domain 3: Smart Education</div>
+              <span class="domain-card-badge icon-box-d3">Air-Drawing & Fatigue</span>
+            </div>
+          </div>
+          <div class="domain-card-desc">
+            Air-Drawing virtual teaching board powered by MediaPipe Hands (draw with index finger, hover with 2 fingers, erase with palm, clear with fist) plus live student attention & fatigue monitor.
+          </div>
+          <ul class="domain-features-list">
+            <li><i class="fa-solid fa-check text-amber-400"></i> Touchless hand air-drawing (no mouse needed)</li>
+            <li><i class="fa-solid fa-check text-amber-400"></i> Blackboard & Whiteboard themes with PNG export</li>
+            <li><i class="fa-solid fa-check text-amber-400"></i> Live Eye Aspect Ratio (EAR) blink & drowsiness tracker</li>
+            <li><i class="fa-solid fa-check text-amber-400"></i> Live Mouth Aspect Ratio (MAR) yawn detector</li>
+          </ul>
+        </div>
+        <button class="launch-btn" onclick="switchDomain('d3', document.querySelector('.tab-btn.d3'))">
+          <span>Enter Education Studio</span>
+          <i class="fa-solid fa-arrow-right"></i>
+        </button>
+      </div>
+
+      <!-- Domain 4 Card -->
+      <div class="domain-card">
+        <div>
+          <div class="domain-card-header">
+            <div class="domain-icon-box icon-box-d4">
+              <i class="fa-solid fa-apple-whole"></i>
+            </div>
+            <div>
+              <div class="domain-card-title">Domain 4: Auto Food Tracker</div>
+              <span class="domain-card-badge icon-box-d4">Zero Dropdown Required</span>
+            </div>
+          </div>
+          <div class="domain-card-desc">
+            Automatic camera food reader: point the camera at any fruit, vegetable, or prepared dish — the neural engine identifies the food, calculates calories per 100g, and logs to daily tracker.
+          </div>
+          <ul class="domain-features-list">
+            <li><i class="fa-solid fa-check text-rose-400"></i> No manual dropdown search required</li>
+            <li><i class="fa-solid fa-check text-rose-400"></i> High-accuracy neural & chromatic food classifier</li>
+            <li><i class="fa-solid fa-check text-rose-400"></i> Dynamic portion slider with live calorie calculation</li>
+            <li><i class="fa-solid fa-check text-rose-400"></i> Daily calorie budget meter & one-click CSV export</li>
+          </ul>
+        </div>
+        <button class="launch-btn" onclick="switchDomain('d4', document.querySelector('.tab-btn.d4'))">
+          <span>Enter Food Tracker</span>
+          <i class="fa-solid fa-arrow-right"></i>
+        </button>
+      </div>
+    </div>
+  </section>
+
+
+  <!-- ======================================================== -->
   <!-- DOMAIN 1: SMART VISION ASSISTANT (BUILT FOR THE BLIND)   -->
   <!-- ======================================================== -->
-  <section id="domain1" class="domain-section active">
+  <section id="domain1" class="domain-section">
     <div class="assistive-banner">
       <i class="fa-solid fa-universal-access" style="font-size:22px; color:#818cf8;"></i>
       <div>
@@ -472,7 +709,8 @@ tr:hover { background: rgba(255, 255, 255, 0.02); }
           <canvas id="visionOverlayCanvas"></canvas>
           <div id="visionPlaceholder" class="camera-placeholder">
             <i class="fa-solid fa-eye-slash"></i>
-            <p>Camera is paused. Click <b>Start Assistive Camera</b> to begin live detection.</p>
+            <p>Click <b>Start Assistive Camera</b> to begin live detection.</p>
+            <span style="font-size:11px; opacity:0.7;">(If camera is blocked, allow camera permissions in browser URL bar)</span>
           </div>
         </div>
         <div class="btn-group">
@@ -541,16 +779,26 @@ tr:hover { background: rgba(255, 255, 255, 0.02); }
         <div class="card">
           <div class="card-header">
             <div class="card-title"><i class="fa-solid fa-apple-whole text-emerald-400"></i> Edible Produce Scanner</div>
-            <div style="width:170px;">
+            <div style="width:190px;">
               <select id="produceSelect" class="select-input">
-                <option value="Tomato">Tomato (Fruit)</option>
+                <option value="Auto-Detect" selected>✨ Auto-Detect Produce</option>
+                <option value="Apple">Apple (Fruit)</option>
                 <option value="Banana">Banana (Fruit)</option>
+                <option value="Orange">Orange (Fruit)</option>
                 <option value="Mango">Mango (Fruit)</option>
+                <option value="Strawberry">Strawberry (Fruit)</option>
+                <option value="Watermelon">Watermelon (Fruit)</option>
+                <option value="Pineapple">Pineapple (Fruit)</option>
+                <option value="Lemon">Lemon (Fruit)</option>
                 <option value="Avocado">Avocado (Fruit)</option>
-                <option value="Capsicum">Capsicum (Veg)</option>
-                <option value="Cucumber">Cucumber (Veg)</option>
-                <option value="Carrot">Carrot (Veg)</option>
-                <option value="Brinjal">Brinjal (Veg)</option>
+                <option value="Tomato">Tomato (Vegetable/Fruit)</option>
+                <option value="Potato">Potato (Vegetable)</option>
+                <option value="Onion">Onion (Vegetable)</option>
+                <option value="Carrot">Carrot (Vegetable)</option>
+                <option value="Broccoli">Broccoli (Vegetable)</option>
+                <option value="Cucumber">Cucumber (Vegetable)</option>
+                <option value="Capsicum">Capsicum (Vegetable)</option>
+                <option value="Brinjal">Brinjal / Eggplant (Vegetable)</option>
               </select>
             </div>
           </div>
@@ -560,7 +808,8 @@ tr:hover { background: rgba(255, 255, 255, 0.02); }
             <img id="agriPreviewImg" style="display:none;">
             <div id="agriPlaceholder" class="camera-placeholder">
               <i class="fa-solid fa-carrot"></i>
-              <p>Hold a real edible fruit or vegetable in front of camera.</p>
+              <p>Hold an edible fruit or vegetable in front of camera.</p>
+              <span style="font-size:11px; opacity:0.7;">(Ensure camera permission is allowed in browser)</span>
             </div>
           </div>
 
@@ -638,6 +887,7 @@ tr:hover { background: rgba(255, 255, 255, 0.02); }
             <div id="leafPlaceholder" class="camera-placeholder">
               <i class="fa-solid fa-seedling"></i>
               <p>Start leaf camera or upload a plant leaf photo.</p>
+              <span style="font-size:11px; opacity:0.7;">(Ensure camera permission is allowed in browser)</span>
             </div>
           </div>
           <div class="btn-group">
@@ -730,6 +980,7 @@ tr:hover { background: rgba(255, 255, 255, 0.02); }
             <div id="boardCamPlaceholder" class="camera-placeholder">
               <i class="fa-solid fa-hand-sparkles"></i>
               <p>Click <b>Start Air-Drawing Camera</b> to track hand gestures.</p>
+              <span style="font-size:11px; opacity:0.7;">(Allow camera permission in browser to begin)</span>
             </div>
           </div>
 
@@ -787,25 +1038,33 @@ tr:hover { background: rgba(255, 255, 255, 0.02); }
       <div class="grid-2">
         <div class="card">
           <div class="card-header">
-            <div class="card-title"><i class="fa-solid fa-video text-amber-400"></i> Facial Action & Eye Tracking Camera</div>
+            <div class="card-title"><i class="fa-solid fa-video text-amber-400"></i> Active Recording Attention & Gaze Camera</div>
             <span id="attenStatusBadge" class="badge badge-unripe">Camera Idle</span>
           </div>
 
-          <div class="camera-box" id="attenCamBox" style="aspect-ratio:4/3;">
+          <div class="camera-box" id="attenCamBox" style="aspect-ratio:4/3; position:relative;">
+            <!-- Active Recording Indicator Badge -->
+            <div id="attenRecBadge" style="display:none; position:absolute; top:12px; left:12px; background:rgba(220, 38, 38, 0.92); color:#fff; padding:5px 12px; border-radius:9999px; font-size:12px; font-weight:700; display:flex; align-items:center; gap:8px; z-index:10; box-shadow:0 0 12px rgba(239, 68, 68, 0.7);">
+              <span style="width:9px; height:9px; background:#fff; border-radius:50%; display:inline-block; box-shadow:0 0 6px #fff;"></span>
+              <span>LIVE ACTIVE RECORDING</span>
+              <span id="attenRecTimer" style="opacity:0.9; font-family:monospace; margin-left:4px; font-weight:800;">00:00</span>
+            </div>
+
             <video id="attenVideo" autoplay playsinline muted style="display:none; transform:scaleX(-1);"></video>
             <canvas id="attenCanvas" style="transform:scaleX(-1);"></canvas>
             <div id="attenPlaceholder" class="camera-placeholder">
               <i class="fa-solid fa-user-clock"></i>
-              <p>Click <b>Start Attention Camera</b> to track live eye movements, blinks, and yawns.</p>
+              <p>Click <b>Start Active Recording</b> to continuously track eye movements, blinks, head motion, and yawns in real-time.</p>
+              <span style="font-size:11px; opacity:0.7;">(Ensure camera access is enabled in browser)</span>
             </div>
           </div>
 
           <div class="btn-group">
             <button class="btn btn-warning" style="background:#d97706;" onclick="startAttentionCamera()">
-              <i class="fa-solid fa-camera"></i> Start Attention Camera
+              <i class="fa-solid fa-record-vinyl"></i> Start Active Recording
             </button>
             <button class="btn btn-secondary" onclick="stopAttentionCamera()">
-              <i class="fa-solid fa-stop"></i> Stop Camera
+              <i class="fa-solid fa-stop"></i> Stop Recording
             </button>
             <button class="btn btn-secondary" onclick="resetAttentionSession()">
               <i class="fa-solid fa-rotate"></i> Reset Stats
@@ -815,20 +1074,31 @@ tr:hover { background: rgba(255, 255, 255, 0.02); }
 
         <div class="card">
           <div class="card-header">
-            <div class="card-title"><i class="fa-solid fa-chart-line text-amber-400"></i> Live Attention Telemetry</div>
+            <div class="card-title"><i class="fa-solid fa-chart-line text-amber-400"></i> Active Telemetry HUD</div>
             <span id="attenAvgBadge" class="badge badge-ripe">Focus: 98%</span>
           </div>
 
           <div id="drowsyAlertBanner" style="display:none;" class="alert-banner">
             <i class="fa-solid fa-bed" style="font-size:20px;"></i>
-            <span>⚠️ DROWSINESS DETECTED: Eyes closed for over 1.2 seconds! Please stay alert.</span>
+            <span>⚠️ DROWSINESS ALERT: Prolonged eye closure detected! Please stay alert.</span>
           </div>
 
-          <div class="grid-3" style="margin-bottom:18px;">
+          <div class="grid-3" style="margin-bottom:12px;">
             <div style="background:#0a0f1d; padding:12px; border-radius:8px; border:1px solid var(--border); text-align:center;">
               <div style="font-size:11px; color:var(--text-muted);">LIVE EAR (EYES)</div>
               <div id="telemetryEar" style="font-size:22px; font-weight:700; color:#60a5fa;">0.28</div>
             </div>
+            <div style="background:#0a0f1d; padding:12px; border-radius:8px; border:1px solid var(--border); text-align:center;">
+              <div style="font-size:11px; color:var(--text-muted);">LIVE MAR (MOUTH)</div>
+              <div id="telemetryMar" style="font-size:22px; font-weight:700; color:#38bdf8;">0.35</div>
+            </div>
+            <div style="background:#0a0f1d; padding:12px; border-radius:8px; border:1px solid var(--border); text-align:center;">
+              <div style="font-size:11px; color:var(--text-muted);">HEAD / GAZE</div>
+              <div id="telemetryGaze" style="font-size:16px; font-weight:700; color:#34d399; margin-top:4px;">Center</div>
+            </div>
+          </div>
+
+          <div class="grid-3" style="margin-bottom:16px;">
             <div style="background:#0a0f1d; padding:12px; border-radius:8px; border:1px solid var(--border); text-align:center;">
               <div style="font-size:11px; color:var(--text-muted);">TOTAL BLINKS</div>
               <div id="attenBlinksCount" style="font-size:22px; font-weight:700; color:#fbbf24;">0</div>
@@ -837,14 +1107,18 @@ tr:hover { background: rgba(255, 255, 255, 0.02); }
               <div style="font-size:11px; color:var(--text-muted);">TOTAL YAWNS</div>
               <div id="attenYawnsCount" style="font-size:22px; font-weight:700; color:#f87171;">0</div>
             </div>
+            <div style="background:#0a0f1d; padding:12px; border-radius:8px; border:1px solid var(--border); text-align:center;">
+              <div style="font-size:11px; color:var(--text-muted);">MOVEMENTS</div>
+              <div id="attenMoveCount" style="font-size:22px; font-weight:700; color:#a78bfa;">0</div>
+            </div>
           </div>
 
-          <div style="font-size:13px; font-weight:700; color:var(--text-muted); margin-bottom:8px;">STUDENT METRICS & ATTENTION SCORE</div>
-          <div style="max-height:220px; overflow-y:auto;">
+          <div style="font-size:13px; font-weight:700; color:var(--text-muted); margin-bottom:8px;">ACTIVE PARTICIPANT TELEMETRY</div>
+          <div style="max-height:200px; overflow-y:auto;">
             <table>
-              <thead><tr><th>Student</th><th>EAR (Eyes)</th><th>MAR (Mouth)</th><th>Status</th><th>Score</th></tr></thead>
+              <thead><tr><th>Student</th><th>EAR</th><th>MAR</th><th>Head Motion</th><th>Status</th><th>Score</th></tr></thead>
               <tbody id="attenTableBody">
-                <tr><td>Student #1</td><td>0.280</td><td>0.350</td><td><span class="badge badge-ripe">Attentive</span></td><td>98%</td></tr>
+                <tr><td>Student #1</td><td>0.280</td><td>0.350</td><td>Center</td><td><span class="badge badge-ripe">Attentive</span></td><td>98%</td></tr>
               </tbody>
             </table>
           </div>
@@ -861,7 +1135,7 @@ tr:hover { background: rgba(255, 255, 255, 0.02); }
       <i class="fa-solid fa-bolt" style="font-size:22px; color:#f87171;"></i>
       <div>
         <b>Automatic Food Reading Engine Active (No Manual Dropdown):</b>
-        Point the camera at your food or upload a photo. The system will accurately identify the edible dish, compute calories, and prepare it for instant logging.
+        Point the camera at your food or upload a picture. The system will accurately identify the edible dish, compute calories, and prepare it for instant logging.
       </div>
     </div>
 
@@ -879,6 +1153,7 @@ tr:hover { background: rgba(255, 255, 255, 0.02); }
           <div id="foodPlaceholder" class="camera-placeholder">
             <i class="fa-solid fa-utensils"></i>
             <p>Start camera and click <b>Capture & Read Food</b>, or upload a photo.</p>
+            <span style="font-size:11px; opacity:0.7;">(Ensure camera access is enabled in browser)</span>
           </div>
         </div>
 
@@ -993,9 +1268,18 @@ function switchDomain(domainId, btn) {
   document.querySelectorAll('.domain-section').forEach(el => el.classList.remove('active'));
   document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
   
-  const target = document.getElementById(domainId === 'd1' ? 'domain1' : domainId === 'd2' ? 'domain2' : domainId === 'd3' ? 'domain3' : 'domain4');
-  if (target) target.classList.add('active');
-  btn.classList.add('active');
+  let targetId = 'landingPage';
+  if (domainId === 'd1') targetId = 'domain1';
+  else if (domainId === 'd2') targetId = 'domain2';
+  else if (domainId === 'd3') targetId = 'domain3';
+  else if (domainId === 'd4') targetId = 'domain4';
+  
+  const target = document.getElementById(targetId);
+  if (target) {
+    target.classList.add('active');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+  if (btn) btn.classList.add('active');
 }
 
 function switchAgriTab(sub, btn) {
@@ -1010,6 +1294,35 @@ function switchEduTab(sub, btn) {
   btn.classList.add('active');
   document.getElementById('eduBoardSection').style.display = sub === 'board' ? 'block' : 'none';
   document.getElementById('eduAttentionSection').style.display = sub === 'attention' ? 'block' : 'none';
+}
+
+// Helper: Safe camera request with permission guidance
+async function requestCameraStream(videoEl, placeholderEl, width=640, height=480) {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    alert("Camera API not available in this context.\\n\\nMake sure you open the website using: http://localhost:8000\\n(Modern browsers restrict camera to localhost or HTTPS).");
+    return null;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: width, height: height, facingMode: 'user' }
+    });
+    videoEl.srcObject = stream;
+    videoEl.style.display = 'block';
+    if (placeholderEl) placeholderEl.style.display = 'none';
+    return stream;
+  } catch(err) {
+    console.error("Camera access error:", err);
+    let msg = "Camera could not be started.";
+    if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+      msg = "Camera permission was blocked by your browser.\\n\\nHow to enable:\\n1. Click the lock / settings icon in your browser URL bar (next to http://localhost:8000)\\n2. Set 'Camera' to 'Allow'\\n3. Reload the page.";
+    } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
+      msg = "No webcam device was found. Please connect a camera or use the 'Upload Photo' option.";
+    } else if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
+      msg = "Your webcam is currently in use by another app (like Zoom, Teams, or another browser tab). Please close other apps and try again.";
+    }
+    alert(msg);
+    return null;
+  }
 }
 
 // ==========================================
@@ -1029,21 +1342,14 @@ cocoSsd.load().then(model => {
 }).catch(e => console.warn("COCO-SSD CDN load notice:", e));
 
 async function startVisionCamera() {
-  try {
-    const video = document.getElementById('visionVideo');
-    visionStream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
-    video.srcObject = visionStream;
-    video.style.display = 'block';
-    document.getElementById('visionPlaceholder').style.display = 'none';
+  const video = document.getElementById('visionVideo');
+  const placeholder = document.getElementById('visionPlaceholder');
+  visionStream = await requestCameraStream(video, placeholder);
+  if (visionStream) {
     document.getElementById('visionStatus').className = 'badge badge-ripe';
     document.getElementById('visionStatus').textContent = 'Live Assistive Scanner';
-
-    video.onloadeddata = () => {
-      runVisionLoop();
-    };
+    video.onloadeddata = () => runVisionLoop();
     speakText("Assistive vision started. Scanning for obstacles and surroundings.");
-  } catch(e) {
-    alert("Camera permission denied. Use 'Test Navigation Sample' to test.");
   }
 }
 
@@ -1228,15 +1534,11 @@ let agriStream = null;
 let leafStream = null;
 
 async function startAgriCamera() {
-  try {
-    const video = document.getElementById('agriVideo');
-    agriStream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
-    video.srcObject = agriStream;
-    video.style.display = 'block';
-    document.getElementById('agriPlaceholder').style.display = 'none';
+  const video = document.getElementById('agriVideo');
+  const placeholder = document.getElementById('agriPlaceholder');
+  agriStream = await requestCameraStream(video, placeholder);
+  if (agriStream) {
     document.getElementById('agriPreviewImg').style.display = 'none';
-  } catch(e) {
-    alert("Camera permission denied. Please upload a produce image instead.");
   }
 }
 
@@ -1272,11 +1574,23 @@ async function captureAndAnalyzeRipeness() {
   }
 
   const item = document.getElementById('produceSelect').value;
+  let labelHint = "";
+  if (mobileNetModel) {
+    try {
+      const targetEl = (video.srcObject && video.style.display !== 'none') ? video : preview;
+      const preds = await mobileNetModel.classify(targetEl);
+      if (preds && preds.length > 0) {
+        labelHint = preds.map(p => p.className).join(", ");
+        console.log("Produce neural hints:", labelHint);
+      }
+    } catch(e) {}
+  }
+
   try {
     const resp = await fetch('/api/ripeness', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ image: b64, item: item })
+      body: JSON.stringify({ image: b64, item: item, label_hint: labelHint })
     });
     const res = await resp.json();
     renderRipenessResults(res);
@@ -1346,17 +1660,13 @@ function renderRipenessResults(data) {
 // Leaf Disease Camera & Upload Handlers
 // ------------------------------------------
 async function startLeafCamera() {
-  try {
-    const video = document.getElementById('leafVideo');
-    leafStream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
-    video.srcObject = leafStream;
-    video.style.display = 'block';
-    document.getElementById('leafPlaceholder').style.display = 'none';
+  const video = document.getElementById('leafVideo');
+  const placeholder = document.getElementById('leafPlaceholder');
+  leafStream = await requestCameraStream(video, placeholder);
+  if (leafStream) {
     document.getElementById('leafPreviewImg').style.display = 'none';
     document.getElementById('leafCamBadge').className = 'badge badge-ripe';
     document.getElementById('leafCamBadge').textContent = 'Camera Live';
-  } catch(e) {
-    alert("Camera permission denied. You can upload a leaf photo instead.");
   }
 }
 
@@ -1519,15 +1829,12 @@ function setupMediaPipeHands() {
 }
 
 async function startBoardCamera() {
-  try {
-    setupMediaPipeHands();
-    const video = document.getElementById('boardCamVideo');
-    boardCamStream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
-    video.srcObject = boardCamStream;
-    video.style.display = 'block';
-    document.getElementById('boardCamPlaceholder').style.display = 'none';
+  setupMediaPipeHands();
+  const video = document.getElementById('boardCamVideo');
+  const placeholder = document.getElementById('boardCamPlaceholder');
+  boardCamStream = await requestCameraStream(video, placeholder);
+  if (boardCamStream) {
     isBoardCamRunning = true;
-
     const cameraHelper = new Camera(video, {
       onFrame: async () => {
         if (isBoardCamRunning && handsDetector) {
@@ -1537,8 +1844,6 @@ async function startBoardCamera() {
       width: 640, height: 480
     });
     cameraHelper.start();
-  } catch(e) {
-    alert("Camera permission denied. You can still draw manually with mouse/touch.");
   }
 }
 
@@ -1718,11 +2023,17 @@ function saveCanvas() {
 }
 
 // ------------------------------------------
-// Attention Monitor (FaceMesh Eye/Yawn Tracker)
+// Attention Monitor (FaceMesh Active Recording Tracker)
 // ------------------------------------------
 let attenStream = null;
 let faceMeshDetector = null;
 let isAttenRunning = false;
+let attenRecStart = null;
+let attenRecInterval = null;
+let prevNoseX = null;
+let prevNoseY = null;
+let currentGaze = "Center";
+let currentMovement = 0.0;
 
 function setupFaceMesh() {
   if (typeof FaceMesh === 'undefined') return;
@@ -1739,16 +2050,25 @@ function setupFaceMesh() {
 }
 
 async function startAttentionCamera() {
-  try {
-    setupFaceMesh();
-    const video = document.getElementById('attenVideo');
-    attenStream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
-    video.srcObject = attenStream;
-    video.style.display = 'block';
-    document.getElementById('attenPlaceholder').style.display = 'none';
+  setupFaceMesh();
+  const video = document.getElementById('attenVideo');
+  const placeholder = document.getElementById('attenPlaceholder');
+  attenStream = await requestCameraStream(video, placeholder);
+  if (attenStream) {
     document.getElementById('attenStatusBadge').className = 'badge badge-ripe';
-    document.getElementById('attenStatusBadge').textContent = 'Tracking Eyes & Mouth';
+    document.getElementById('attenStatusBadge').textContent = 'Live Active Recording';
+    document.getElementById('attenRecBadge').style.display = 'flex';
     isAttenRunning = true;
+    attenRecStart = Date.now();
+
+    if (attenRecInterval) clearInterval(attenRecInterval);
+    attenRecInterval = setInterval(() => {
+      if (!isAttenRunning || !attenRecStart) return;
+      const elapsed = Math.floor((Date.now() - attenRecStart) / 1000);
+      const mins = String(Math.floor(elapsed / 60)).padStart(2, '0');
+      const secs = String(elapsed % 60).padStart(2, '0');
+      document.getElementById('attenRecTimer').textContent = `${mins}:${secs}`;
+    }, 1000);
 
     const cameraHelper = new Camera(video, {
       onFrame: async () => {
@@ -1759,8 +2079,6 @@ async function startAttentionCamera() {
       width: 640, height: 480
     });
     cameraHelper.start();
-  } catch(e) {
-    alert("Camera permission denied. Attention monitoring requires camera access.");
   }
 }
 
@@ -1770,8 +2088,14 @@ function stopAttentionCamera() {
     attenStream = null;
   }
   isAttenRunning = false;
+  if (attenRecInterval) clearInterval(attenRecInterval);
+  attenRecStart = null;
+  prevNoseX = null;
+  prevNoseY = null;
+
   document.getElementById('attenVideo').style.display = 'none';
   document.getElementById('attenPlaceholder').style.display = 'flex';
+  document.getElementById('attenRecBadge').style.display = 'none';
   document.getElementById('attenStatusBadge').className = 'badge badge-unripe';
   document.getElementById('attenStatusBadge').textContent = 'Camera Idle';
 }
@@ -1782,7 +2106,10 @@ function onFaceResults(results) {
   const ctx = canvas.getContext('2d');
   ctx.clearRect(0, 0, 640, 480);
 
-  if (!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) return;
+  if (!results.multiFaceLandmarks || results.multiFaceLandmarks.length === 0) {
+    prevNoseX = null; prevNoseY = null;
+    return;
+  }
   const lm = results.multiFaceLandmarks[0];
 
   function dist(i1, i2) {
@@ -1791,34 +2118,83 @@ function onFaceResults(results) {
     return Math.hypot(dx, dy);
   }
 
+  // 1. EAR (Eye Aspect Ratio) calculation
   const leftEar = (dist(385, 380) + dist(387, 373)) / (2.0 * Math.max(1, dist(362, 263)));
   const rightEar = (dist(160, 144) + dist(158, 153)) / (2.0 * Math.max(1, dist(33, 133)));
   const avgEar = (leftEar + rightEar) / 2.0;
+
+  // 2. MAR (Mouth Aspect Ratio) calculation
   const mar = dist(13, 14) / Math.max(1, dist(78, 308));
 
-  const eyesClosed = avgEar < 0.20;
-  const isYawning = mar > 0.65;
+  // 3. Head & Gaze Movement Tracking
+  const noseX = lm[1].x * 640;
+  const noseY = lm[1].y * 480;
+  let movement = 0;
+  if (prevNoseX !== null) {
+    movement = Math.hypot(noseX - prevNoseX, noseY - prevNoseY);
+  }
+  prevNoseX = noseX;
+  prevNoseY = noseY;
+  currentMovement = movement;
 
+  const eyeMidX = (lm[33].x + lm[263].x) / 2.0;
+  let gaze = "Center";
+  if (lm[1].x - eyeMidX > 0.038) {
+    gaze = "Looking Right";
+  } else if (lm[1].x - eyeMidX < -0.038) {
+    gaze = "Looking Left";
+  } else if (lm[1].y > lm[152].y - 0.07) {
+    gaze = "Looking Down";
+  }
+  currentGaze = gaze;
+
+  const eyesClosed = avgEar < 0.20;
+  const isYawning = mar > 0.60;
+
+  // 4. Live Visual Overlays on Active Feed
+  // Eyes
   ctx.fillStyle = eyesClosed ? '#ef4444' : '#10b981';
   [33, 133, 160, 144, 362, 263, 385, 380].forEach(idx => {
     ctx.beginPath();
-    ctx.arc(lm[idx].x * 640, lm[idx].y * 480, 3, 0, 2 * Math.PI);
+    ctx.arc(lm[idx].x * 640, lm[idx].y * 480, 3.5, 0, 2 * Math.PI);
     ctx.fill();
   });
 
+  // Mouth
   ctx.fillStyle = isYawning ? '#f59e0b' : '#38bdf8';
   [13, 14, 78, 308].forEach(idx => {
     ctx.beginPath();
-    ctx.arc(lm[idx].x * 640, lm[idx].y * 480, 3, 0, 2 * Math.PI);
+    ctx.arc(lm[idx].x * 640, lm[idx].y * 480, 3.5, 0, 2 * Math.PI);
     ctx.fill();
   });
 
+  // Nose Gaze Target
+  ctx.strokeStyle = movement > 16 ? '#f43f5e' : '#34d399';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(noseX, noseY, 12, 0, 2 * Math.PI);
+  ctx.stroke();
+
+  // Active HUD watermark
+  ctx.fillStyle = 'rgba(11, 17, 32, 0.75)';
+  ctx.fillRect(12, 12, 210, 52);
+  ctx.fillStyle = eyesClosed ? '#ef4444' : '#10b981';
+  ctx.font = 'bold 12px sans-serif';
+  ctx.fillText(eyesClosed ? '● EYES CLOSED (BLINK)' : '● EYES OPEN', 20, 30);
+  ctx.fillStyle = '#cbd5e1';
+  ctx.font = '11px sans-serif';
+  ctx.fillText(`EAR: ${avgEar.toFixed(2)} | MAR: ${mar.toFixed(2)} | ${gaze}`, 20, 50);
+
+  // Update live meters
   document.getElementById('telemetryEar').textContent = avgEar.toFixed(3);
-  sendAttentionTelemetry(1, avgEar, mar, eyesClosed, isYawning);
+  document.getElementById('telemetryMar').textContent = mar.toFixed(3);
+  document.getElementById('telemetryGaze').textContent = gaze;
+
+  sendAttentionTelemetry(1, avgEar, mar, eyesClosed, isYawning, movement, gaze);
 }
 
 let lastAttenSend = 0;
-async function sendAttentionTelemetry(sid, ear, mar, isClosed, isYawn) {
+async function sendAttentionTelemetry(sid, ear, mar, isClosed, isYawn, movement, gaze) {
   const now = Date.now();
   if (now - lastAttenSend < 300) return;
   lastAttenSend = now;
@@ -1827,22 +2203,23 @@ async function sendAttentionTelemetry(sid, ear, mar, isClosed, isYawn) {
     const resp = await fetch('/api/attention-eval', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ student_id: sid, ear, mar, eyes_closed: isClosed, yawning: isYawn })
+      body: JSON.stringify({ student_id: sid, ear, mar, eyes_closed: isClosed, yawning: isYawn, movement, gaze })
     });
     const data = await resp.json();
-    renderAttentionTelemetry(data.summary, isClosed, isYawn);
+    renderAttentionTelemetry(data.summary, isClosed, isYawn, gaze);
   } catch(e) {}
 }
 
 async function resetAttentionSession() {
   const resp = await fetch('/api/attention-reset', { method: 'POST' });
   const data = await resp.json();
-  renderAttentionTelemetry(data.summary, false, false);
+  renderAttentionTelemetry(data.summary, false, false, "Center");
 }
 
-function renderAttentionTelemetry(summary, isClosed, isYawn) {
+function renderAttentionTelemetry(summary, isClosed, isYawn, gaze) {
   document.getElementById('attenBlinksCount').textContent = summary.total_blinks;
   document.getElementById('attenYawnsCount').textContent = summary.total_yawns;
+  document.getElementById('attenMoveCount').textContent = summary.total_movements;
   document.getElementById('attenAvgBadge').textContent = `Focus: ${summary.avg_attention}%`;
 
   const drowsyBanner = document.getElementById('drowsyAlertBanner');
@@ -1861,6 +2238,7 @@ function renderAttentionTelemetry(summary, isClosed, isYawn) {
       <td>Student #${s.id}</td>
       <td>${s.ear}</td>
       <td>${s.mar}</td>
+      <td>${s.gaze || gaze || 'Center'}</td>
       <td><span class="badge ${s.is_drowsy ? 'badge-rotten' : s.is_yawning ? 'badge-unripe' : 'badge-ripe'}">${s.is_drowsy ? 'DROWSY' : s.is_yawning ? 'YAWNING' : 'Attentive'}</span></td>
       <td><b>${s.attention_score}%</b></td>
     `;
@@ -1876,24 +2254,19 @@ let currentDetectedFood = "Apple";
 let currentKcalPer100 = 52;
 let mobileNetModel = null;
 
-// Preload MobileNet for accurate food classification
 mobilenet.load().then(model => {
   mobileNetModel = model;
   console.log("MobileNet loaded for food identification.");
 }).catch(e => console.warn("MobileNet notice:", e));
 
 async function startFoodCamera() {
-  try {
-    const video = document.getElementById('foodVideo');
-    foodStream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
-    video.srcObject = foodStream;
-    video.style.display = 'block';
-    document.getElementById('foodPlaceholder').style.display = 'none';
+  const video = document.getElementById('foodVideo');
+  const placeholder = document.getElementById('foodPlaceholder');
+  foodStream = await requestCameraStream(video, placeholder);
+  if (foodStream) {
     document.getElementById('foodPreviewImg').style.display = 'none';
     document.getElementById('foodCamBadge').className = 'badge badge-ripe';
     document.getElementById('foodCamBadge').textContent = 'Camera Ready';
-  } catch(e) {
-    alert("Camera permission denied. You can upload a meal photo instead.");
   }
 }
 
@@ -1912,13 +2285,12 @@ async function captureAndIdentifyFood() {
     preview.style.display = 'block';
     video.style.display = 'none';
 
-    // Run MobileNet client-side for neural food label hint
     if (mobileNetModel) {
       try {
         const preds = await mobileNetModel.classify(video);
         if (preds && preds.length > 0) {
-          labelHint = preds[0].className;
-          console.log("MobileNet top pred:", labelHint);
+          labelHint = preds.map(p => p.className).join(", ");
+          console.log("MobileNet multi-label hints:", labelHint);
         }
       } catch(e) {}
     }
@@ -1927,7 +2299,10 @@ async function captureAndIdentifyFood() {
     if (mobileNetModel) {
       try {
         const preds = await mobileNetModel.classify(preview);
-        if (preds && preds.length > 0) labelHint = preds[0].className;
+        if (preds && preds.length > 0) {
+          labelHint = preds.map(p => p.className).join(", ");
+          console.log("MobileNet preview hints:", labelHint);
+        }
       } catch(e) {}
     }
   } else {
@@ -1982,12 +2357,17 @@ function renderDetectedFood(res) {
   currentDetectedFood = res.food;
   currentKcalPer100 = res.calories_per_100g || 50;
 
-  // Render food emoji icon
   const emojiMap = {
     "Apple": "🍎", "Banana": "🍌", "Orange": "🍊", "Mango": "🥭", "Grapes": "🍇", "Watermelon": "🍉",
+    "Strawberry": "🍓", "Pineapple": "🍍", "Papaya": "🍈", "Guava": "🍐", "Kiwi": "🥝", "Lemon": "🍋",
+    "Lime": "🍋", "Peach": "🍑", "Pear": "🍐", "Plum": "🫐", "Pomegranate": "🍒", "Avocado": "🥑",
+    "Cherry": "🍒", "Blueberry": "🫐", "Raspberry": "🍓", "Coconut": "🥥", "Tomato": "🍅", "Potato": "🥔",
+    "Sweet Potato": "🍠", "Onion": "🧅", "Garlic": "🧄", "Ginger": "🫚", "Carrot": "🥕", "Broccoli": "🥦",
+    "Cauliflower": "🥦", "Cucumber": "🥒", "Capsicum": "🫑", "Chili": "🌶️", "Cabbage": "🥬", "Lettuce": "🥬",
+    "Spinach": "🥬", "Eggplant": "🍆", "Okra": "🫑", "Zucchini": "🥒", "Peas": "🫛", "Green Beans": "🫛",
+    "Corn": "🌽", "Pumpkin": "🎃", "Radish": "🥕", "Beetroot": "🍠", "Mushroom": "🍄",
     "Rice": "🍚", "Chapati": "🫓", "Bread": "🍞", "Dosa": "🥞", "Idli": "🥟", "Poha": "🍲",
-    "Egg": "🥚", "Chicken": "🍗", "Fish": "🐟", "Potato": "🥔", "Tomato": "🍅", "Carrot": "🥕",
-    "Broccoli": "🥦", "Cucumber": "🥒", "Capsicum": "🫑", "Salad": "🥗", "Pizza": "🍕", "Sandwich": "🥪"
+    "Egg": "🥚", "Chicken": "🍗", "Fish": "🐟", "Salad": "🥗", "Pizza": "🍕", "Sandwich": "🥪"
   };
   const icon = emojiMap[res.food] || "🍽️";
 
@@ -2115,5 +2495,6 @@ routes = [
 app = Starlette(routes=routes)
 
 if __name__ == "__main__":
-    print("Starting Multi-Domain Suite on http://0.0.0.0:8000 ...")
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    port = int(os.environ.get("PORT", 8000))
+    print(f"Starting Multi-Domain Suite on http://0.0.0.0:{port} ...")
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")

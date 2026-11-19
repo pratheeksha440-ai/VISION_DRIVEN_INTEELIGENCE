@@ -8,10 +8,28 @@ from collections import Counter
 # ==========================================
 
 PRODUCE_LIST = [
-    "Tomato", "Banana", "Mango", "Avocado",          # fruits
-    "Capsicum", "Cucumber", "Carrot", "Brinjal",     # vegetables
+    "Auto-Detect",
+    # Fruits
+    "Apple", "Banana", "Orange", "Mango", "Grapes", "Watermelon", "Strawberry",
+    "Pineapple", "Papaya", "Guava", "Kiwi", "Lemon", "Peach", "Pear", "Plum",
+    "Pomegranate", "Avocado",
+    # Vegetables
+    "Tomato", "Potato", "Onion", "Carrot", "Broccoli", "Cauliflower", "Cucumber",
+    "Capsicum", "Chili", "Cabbage", "Spinach", "Brinjal", "Okra", "Zucchini",
+    "Corn", "Pumpkin", "Radish", "Beetroot", "Mushroom"
 ]
-VEGETABLES = {"Capsicum", "Cucumber", "Carrot", "Brinjal"}
+
+CANDIDATE_ITEMS = [
+    "Tomato", "Banana", "Apple", "Mango", "Orange", "Carrot", "Cucumber",
+    "Capsicum", "Strawberry", "Broccoli", "Cauliflower", "Potato", "Onion",
+    "Avocado", "Brinjal", "Lemon", "Watermelon", "Pineapple"
+]
+
+VEGETABLES = {
+    "Tomato", "Potato", "Onion", "Carrot", "Broccoli", "Cauliflower", "Cucumber",
+    "Capsicum", "Chili", "Cabbage", "Spinach", "Brinjal", "Okra", "Zucchini",
+    "Corn", "Pumpkin", "Radish", "Beetroot", "Mushroom"
+}
 
 RULES = {
     "Tomato":   (25, 12),
@@ -133,9 +151,9 @@ def validate_edible_item(img_hsv, contour, item):
     return True, "Valid edible produce"
 
 
-def analyze_ripeness(image_bgr, item="Tomato"):
+def _analyze_single_item(image_bgr, item="Tomato"):
     """
-    Performs HSV color segmentation with strict edible validation.
+    Performs HSV color segmentation with strict edible validation for a specific produce item.
     """
     is_veg = item in VEGETABLES
     mode = "Freshness" if is_veg else "Ripeness"
@@ -297,6 +315,36 @@ def analyze_ripeness(image_bgr, item="Tomato"):
         "shelf_life": shelf_life,
         "overlay_b64": overlay_b64
     }
+
+
+def analyze_ripeness(image_bgr, item="Auto-Detect", label_hint=None):
+    """
+    Analyzes produce ripeness with automatic edible recognition if item is 'Auto-Detect' or unspecified.
+    """
+    if label_hint:
+        try:
+            from food_engine import FOOD_LABEL_MAP
+            hints = [h.strip().lower() for h in str(label_hint).replace(";", ",").split(",")]
+            for h in hints:
+                for k, canonical in FOOD_LABEL_MAP.items():
+                    if k in h or h in k:
+                        res = _analyze_single_item(image_bgr, canonical)
+                        if res["detected"]:
+                            return res
+        except Exception:
+            pass
+
+    if not item or item in ["Auto-Detect", "Auto", "Any", "Edible Item"]:
+        best_candidate = None
+        for cand in CANDIDATE_ITEMS:
+            res = _analyze_single_item(image_bgr, cand)
+            if res["detected"]:
+                if best_candidate is None or res["confidence"] > best_candidate["confidence"]:
+                    best_candidate = res
+        if best_candidate is not None:
+            return best_candidate
+        return _analyze_single_item(image_bgr, "Edible Produce")
+    return _analyze_single_item(image_bgr, item)
 
 
 # ==========================================
